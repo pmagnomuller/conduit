@@ -1,0 +1,14 @@
+# Binaries
+claude-glm-gateway
+*.exe
+*.test
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local state accidentally copied in
+*.log
+state.json
+upstream-errors.jsonl

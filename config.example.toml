@@ -1,0 +1,42 @@
+# Copy to ~/.config/claude-glm-gateway/config.toml and edit as needed.
+# Every key can be overridden by an environment variable (see README).
+
+listen = "127.0.0.1:8787"
+
+[anthropic]
+base_url = "https://api.anthropic.com"
+max_transient_retries = 2
+
+[glm]
+base_url = "https://api.z.ai/api/anthropic"
+api_key_env = "ZAI_API_KEY"
+# Used when the inbound Claude model ID is not in model_map.
+default_model = "glm-5.2"
+
+# Rewrite Anthropic model IDs → GLM IDs when the breaker is OPEN.
+# Unmapped IDs fall back to default_model above.
+[glm.model_map]
+"claude-opus-5" = "glm-5.2"
+"claude-sonnet-5" = "glm-5.2"
+"claude-haiku-4-5" = "glm-4.5-air"
+"claude-opus-4-6" = "glm-5.2"
+"claude-sonnet-4-6" = "glm-5.2"
+"claude-haiku-4-5-20251001" = "glm-4.5-air"
+
+[breaker]
+fallback_open_seconds = 300
+# 0 = disabled. When >0, open the breaker if a *-remaining header drops below this.
+proactive_threshold = 0
+# Also open when anthropic-ratelimit-unified-*-utilization >= this (0 = disabled).
+proactive_utilization = 0.0
+probe_on_expiry = true
+
+[log]
+level = "info"
+capture_upstream_errors = true
+capture_path = "~/.local/state/claude-glm-gateway/upstream-errors.jsonl"
+
+[paths]
+# Breaker persistence. Empty = $XDG_STATE_HOME/claude-glm-gateway/state.json
+# (or ~/.local/state/claude-glm-gateway/state.json).
+state_path = ""
