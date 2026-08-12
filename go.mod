@@ -1,4 +1,4 @@
-module github.com/pedro-mueller/claude-glm-gateway
+module github.com/pedro-mueller/conduit
 
 go 1.26.5
 

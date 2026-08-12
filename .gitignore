@@ -1,7 +1,13 @@
 # Binaries
 claude-glm-gateway
+/conduit
 *.exe
 *.test
+
+# Secrets
+.env
+.env.*
+!.env.example
 
 # IDE / OS
 .DS_Store
@@ -12,3 +18,4 @@ claude-glm-gateway
 *.log
 state.json
 upstream-errors.jsonl
+.conduit-run-result.txt

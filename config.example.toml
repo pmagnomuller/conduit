@@ -1,4 +1,4 @@
-# Copy to ~/.config/claude-glm-gateway/config.toml and edit as needed.
+# Copy to ~/.config/conduit/config.toml and edit as needed.
 # Every key can be overridden by an environment variable (see README).
 
 listen = "127.0.0.1:8787"
@@ -34,9 +34,9 @@ probe_on_expiry = true
 [log]
 level = "info"
 capture_upstream_errors = true
-capture_path = "~/.local/state/claude-glm-gateway/upstream-errors.jsonl"
+capture_path = "~/.local/state/conduit/upstream-errors.jsonl"
 
 [paths]
-# Breaker persistence. Empty = $XDG_STATE_HOME/claude-glm-gateway/state.json
-# (or ~/.local/state/claude-glm-gateway/state.json).
+# Breaker persistence. Empty = $XDG_STATE_HOME/conduit/state.json
+# (or ~/.local/state/conduit/state.json).
 state_path = ""

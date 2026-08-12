@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedro-mueller/claude-glm-gateway/internal/breaker"
+	"github.com/pedro-mueller/conduit/internal/breaker"
 )
 
 type Counters struct {

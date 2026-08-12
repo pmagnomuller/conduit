@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedro-mueller/claude-glm-gateway/internal/breaker"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/capture"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/config"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/metrics"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/proxy"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/redact"
+	"github.com/pedro-mueller/conduit/internal/breaker"
+	"github.com/pedro-mueller/conduit/internal/capture"
+	"github.com/pedro-mueller/conduit/internal/config"
+	"github.com/pedro-mueller/conduit/internal/metrics"
+	"github.com/pedro-mueller/conduit/internal/proxy"
+	"github.com/pedro-mueller/conduit/internal/redact"
 )
 
 const fakeToken = "sk-ant-secret-token-DO-NOT-LEAK-abc123"

@@ -81,7 +81,7 @@ func Default() Config {
 		Log: LogConfig{
 			Level:                 "info",
 			CaptureUpstreamErrors: true,
-			CapturePath:           "~/.local/state/claude-glm-gateway/upstream-errors.jsonl",
+			CapturePath:           "~/.local/state/conduit/upstream-errors.jsonl",
 		},
 	}
 }
@@ -91,9 +91,9 @@ func DefaultPath() string {
 		return ExpandHome(p)
 	}
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
-		return filepath.Join(xdg, "claude-glm-gateway", "config.toml")
+		return filepath.Join(xdg, "conduit", "config.toml")
 	}
-	return ExpandHome("~/.config/claude-glm-gateway/config.toml")
+	return ExpandHome("~/.config/conduit/config.toml")
 }
 
 func Load(path string) (Config, error) {
@@ -160,9 +160,9 @@ func LoadForTest(path string) (Config, error) {
 
 func DefaultStatePath() string {
 	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
-		return filepath.Join(xdg, "claude-glm-gateway", "state.json")
+		return filepath.Join(xdg, "conduit", "state.json")
 	}
-	return ExpandHome("~/.local/state/claude-glm-gateway/state.json")
+	return ExpandHome("~/.local/state/conduit/state.json")
 }
 
 func ExpandHome(p string) string {

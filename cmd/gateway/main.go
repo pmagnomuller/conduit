@@ -13,20 +13,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pedro-mueller/claude-glm-gateway/internal/breaker"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/capture"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/config"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/metrics"
-	"github.com/pedro-mueller/claude-glm-gateway/internal/proxy"
+	"github.com/pedro-mueller/conduit/internal/breaker"
+	"github.com/pedro-mueller/conduit/internal/capture"
+	"github.com/pedro-mueller/conduit/internal/config"
+	"github.com/pedro-mueller/conduit/internal/metrics"
+	"github.com/pedro-mueller/conduit/internal/proxy"
 )
 
 func main() {
-	configPath := flag.String("config", "", "path to config.toml (default: ~/.config/claude-glm-gateway/config.toml)")
+	configPath := flag.String("config", "", "path to config.toml (default: ~/.config/conduit/config.toml)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "claude-glm-gateway: %v\n", err)
+		fmt.Fprintf(os.Stderr, "conduit: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -41,12 +41,12 @@ func main() {
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "claude-glm-gateway: listen %s: %v\n", cfg.Listen, err)
+		fmt.Fprintf(os.Stderr, "conduit: listen %s: %v\n", cfg.Listen, err)
 		os.Exit(1)
 	}
 	// Defense in depth: refuse non-loopback binds even if config check is bypassed.
 	if addr, ok := ln.Addr().(*net.TCPAddr); ok && addr.IP != nil && !addr.IP.IsLoopback() {
-		fmt.Fprintf(os.Stderr, "claude-glm-gateway: refusing non-loopback bind %s\n", ln.Addr())
+		fmt.Fprintf(os.Stderr, "conduit: refusing non-loopback bind %s\n", ln.Addr())
 		os.Exit(1)
 	}
 

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedro-mueller/claude-glm-gateway/internal/redact"
+	"github.com/pedro-mueller/conduit/internal/redact"
 )
 
 type Record struct {

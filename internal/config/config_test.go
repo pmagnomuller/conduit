@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/pedro-mueller/claude-glm-gateway/internal/config"
+	"github.com/pedro-mueller/conduit/internal/config"
 )
 
 func TestMapModelDefault(t *testing.T) {

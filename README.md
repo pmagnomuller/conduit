@@ -1,50 +1,92 @@
-# claude-glm-gateway
+# conduit
 
 Local loopback HTTP gateway between **Claude Code** and two upstreams:
 
-1. **Anthropic** (your Claude Code subscription OAuth / API key) — default  
-2. **GLM via Z.ai** (`https://api.z.ai/api/anthropic`) — when subscription quota is exhausted
+1. **Anthropic** (Claude Code subscription OAuth) — default  
+2. **GLM via Z.ai** (`https://api.z.ai/api/anthropic`) — when plan quota is exhausted
 
 While the subscription window has capacity, every request goes to Anthropic.
-When a **real plan-quota** signal is observed, the gateway opens a circuit breaker
-and transparently replays to GLM. When the open window expires it **probes**
-Anthropic again and switches back automatically. No Claude Code restart, no
-mid-session config edits.
+When a real plan-quota signal is observed, the gateway opens a circuit breaker
+and transparently replays to GLM. When the open window expires it probes
+Anthropic again and switches back automatically.
 
 ```
 Claude Code
   │  ANTHROPIC_BASE_URL=http://127.0.0.1:8787
   ▼
-claude-glm-gateway (127.0.0.1 only)
+conduit (127.0.0.1 only)
   ├─ breaker CLOSED / PROBE → api.anthropic.com
   └─ breaker OPEN           → api.z.ai/api/anthropic  (GLM)
 ```
 
+## Quick start
+
+```bash
+# 1. Build
+go build -o conduit ./cmd/gateway
+
+# 2. Config + secrets
+mkdir -p ~/.config/conduit ~/.local/state/conduit
+cp config.example.toml ~/.config/conduit/config.toml
+cp .env.example .env   # then put your Z.ai key in .env
+# .env is gitignored — never commit it
+
+# 3. Run (foreground)
+set -a && source .env && set +a
+./conduit -config ~/.config/conduit/config.toml
+
+# Or background:
+# mkdir -p ~/.local/state/conduit
+# nohup ./conduit -config ~/.config/conduit/config.toml \
+#   >~/.local/state/conduit/gateway.log 2>&1 &
+# echo $! > ~/.local/state/conduit/gateway.pid
+```
+
+Point Claude Code at the gateway (new sessions). In `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"
+  }
+}
+```
+
+Or for one shell only:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+claude
+```
+
+Keep normal Claude OAuth. Do **not** put the Z.ai key in Claude’s auth — the gateway injects it only on the GLM path.
+
+Already-running Claude sessions keep their old base URL until restarted.
+
+## Verify it’s working
+
+```bash
+curl -s http://127.0.0.1:8787/_gateway/health
+# → {"ok":true}
+
+curl -s http://127.0.0.1:8787/_gateway/status | jq .
+tail -f ~/.local/state/conduit/gateway.log   # if running in background
+```
+
+After a Claude reply you should see `anthropic_requests` rise and log lines with
+`"provider":"anthropic"`. On plan-quota failover: a `BREAKER OPEN` line, then
+`"provider":"glm"`.
+
 ## Critical constraint
 
-**The Anthropic API does not expose a per-request “this will be billed to API
-credits” flag.** Billing mode is a property of the credential. This gateway only
+The Anthropic API does not expose a per-request “this will be billed to API
+credits” flag. Billing mode is a property of the credential. This gateway only
 reacts to observable HTTP signals (status, `error.type`, rate-limit headers).
 
-Importantly, **not every `429` is quota.** Claude Code distinguishes plan limits
-(unified `anthropic-ratelimit-unified-*` headers) from transient “Server is
-temporarily limiting requests (not your usage limit)” throttles. Only the former
-opens the breaker. Details and sources: [`FINDINGS.md`](./FINDINGS.md).
-
-## Install
-
-```bash
-cd ~/Developer/personal/claude-glm-gateway
-go build -o claude-glm-gateway ./cmd/gateway
-```
-
-Optional: copy the binary onto your `PATH`.
-
-```bash
-mkdir -p ~/.config/claude-glm-gateway
-cp config.example.toml ~/.config/claude-glm-gateway/config.toml
-# edit model_map / listen if you want
-```
+Not every `429` is quota. Claude Code distinguishes plan limits
+(`anthropic-ratelimit-unified-*` headers) from transient “Server is temporarily
+limiting requests (not your usage limit)” throttles. Only the former opens the
+breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 
 ## Environment
 
@@ -57,88 +99,18 @@ cp config.example.toml ~/.config/claude-glm-gateway/config.toml
 | `CLAUDE_GLM_GATEWAY_STATE_PATH` | no | Breaker state file |
 | `CLAUDE_GLM_GATEWAY_CAPTURE_PATH` | no | Upstream error JSONL |
 
-Claude Code keeps using its normal subscription OAuth (`Authorization: Bearer …`
-+ `anthropic-beta: oauth-2025-04-20`). The gateway forwards those headers
-**untouched** to Anthropic. On the GLM path it strips them and substitutes
-`Authorization: Bearer $ZAI_API_KEY`.
-
-## Run (foreground)
-
-```bash
-export ZAI_API_KEY="your-z-ai-key"
-./claude-glm-gateway
-# or: ./claude-glm-gateway -config ~/.config/claude-glm-gateway/config.toml
-```
-
-## Run (background)
-
-```bash
-export ZAI_API_KEY="your-z-ai-key"
-nohup ./claude-glm-gateway >~/.local/state/claude-glm-gateway/gateway.log 2>&1 &
-echo $! > ~/.local/state/claude-glm-gateway/gateway.pid
-```
-
-Stop:
-
-```bash
-kill "$(cat ~/.local/state/claude-glm-gateway/gateway.pid)"
-```
-
-## Point Claude Code at the gateway
-
-In the shell where you launch Claude Code (or in `~/.claude/settings.json` `env`):
-
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
-# Do NOT set ANTHROPIC_AUTH_TOKEN to the Z.ai key — keep subscription OAuth as usual.
-claude
-```
-
-Example `~/.claude/settings.json` fragment:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"
-  }
-}
-```
-
-## Verify
-
-```bash
-curl -s http://127.0.0.1:8787/_gateway/health
-curl -s http://127.0.0.1:8787/_gateway/status | jq .
-```
-
-`/_gateway/status` shows breaker state per model, `until`, session request counts
-per provider, and the last quota event (no credentials).
-
-Structured logs (stdout) include one line per request (`provider`, `status`,
-`failover`) and a loud `BREAKER OPEN|PROBE|CLOSED …` line on every transition.
-
-Upstream non-2xx responses are captured (redacted) to:
-
-`~/.local/state/claude-glm-gateway/upstream-errors.jsonl`
-
-### Prompt caching smoke check
-
-With the gateway on Anthropic (breaker CLOSED), repeat a large stable-prefix
-request and confirm `usage.cache_read_input_tokens` is non-zero. The gateway does
-not reserialize JSON on the Anthropic path.
-
-## Turn it off
-
-1. Stop the gateway process.  
-2. Unset `ANTHROPIC_BASE_URL` (or remove it from `settings.json`).  
-3. Restart Claude Code / open a new terminal.
-
 ## Model mapping
 
 Claude Code sends Anthropic model IDs. When the breaker is OPEN the gateway
 rewrites only the JSON `model` field using `[glm.model_map]` / `default_model`
-(see `config.example.toml`). Default here: opus/sonnet → `glm-5.2`, haiku →
+(see `config.example.toml`). Default: opus/sonnet → `glm-5.2`, haiku →
 `glm-4.5-air`.
+
+## Turn it off
+
+1. Stop the gateway (`kill "$(cat ~/.local/state/conduit/gateway.pid)"`).  
+2. Remove `ANTHROPIC_BASE_URL` from `~/.claude/settings.json` (or unset it).  
+3. Restart Claude Code.
 
 ## Tests
 

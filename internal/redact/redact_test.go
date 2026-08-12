@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/pedro-mueller/claude-glm-gateway/internal/redact"
+	"github.com/pedro-mueller/conduit/internal/redact"
 )
 
 func TestHeadersRedact(t *testing.T) {
