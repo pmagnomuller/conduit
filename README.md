@@ -77,6 +77,19 @@ After a Claude reply you should see `anthropic_requests` rise and log lines with
 `"provider":"anthropic"`. On plan-quota failover: a `BREAKER OPEN` line, then
 `"provider":"glm"`.
 
+### GLM failover notices
+
+When the breaker opens, conduit tells you in three ways:
+
+1. **Inside Claude Code (chat)** — the failover reply’s first text is prefixed with
+   `[conduit] Switched to GLM …`
+2. **Inside Claude Code (status line)** — shows `conduit: GLM` (via your
+   statusline polling `/_gateway/status`)
+3. **Desktop notification** — macOS Notification Center (or `notify-send` on Linux)
+
+Disable with `CONDUIT_NOTIFY=0`, or selectively with `CONDUIT_CHAT_NOTICE=0` /
+`CONDUIT_DESKTOP_NOTIFY=0`.
+
 ## Critical constraint
 
 The Anthropic API does not expose a per-request “this will be billed to API
@@ -98,6 +111,9 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 | `CLAUDE_GLM_GATEWAY_LISTEN` | no | Override `listen` |
 | `CLAUDE_GLM_GATEWAY_STATE_PATH` | no | Breaker state file |
 | `CLAUDE_GLM_GATEWAY_CAPTURE_PATH` | no | Upstream error JSONL |
+| `CONDUIT_NOTIFY` | no | Set to `0` to disable all failover notices |
+| `CONDUIT_CHAT_NOTICE` | no | Set to `0` to disable in-chat GLM notice |
+| `CONDUIT_DESKTOP_NOTIFY` | no | Set to `0` to disable desktop toast |
 
 ## Model mapping
 

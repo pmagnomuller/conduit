@@ -148,7 +148,9 @@ func (b *Breaker) Decide(upstream, model string, now time.Time) State {
 	}
 }
 
-func (b *Breaker) Open(upstream, model, reason string, until time.Time, now time.Time) {
+// Open sets the breaker to OPEN. Returns true if this call newly transitioned
+// into OPEN (false if it was already OPEN and we only refreshed until/reason).
+func (b *Breaker) Open(upstream, model, reason string, until time.Time, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if until.IsZero() || !until.After(now) {
@@ -156,6 +158,7 @@ func (b *Breaker) Open(upstream, model, reason string, until time.Time, now time
 	}
 	key := Key(upstream, model)
 	prev := b.entries[key]
+	newly := prev.State != Open
 	e := Entry{
 		State:      Open,
 		Until:      until,
@@ -172,22 +175,45 @@ func (b *Breaker) Open(upstream, model, reason string, until time.Time, now time
 
 	retryAfter := until.Sub(now).Round(time.Second)
 	b.log("BREAKER OPEN %s -> glm (%s, retry-after=%s)", model, reason, retryAfter)
+	return newly
 }
 
-func (b *Breaker) Close(upstream, model string, now time.Time) {
+// Close clears breaker state for the model. Returns true if an entry was removed.
+func (b *Breaker) Close(upstream, model string, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	key := Key(upstream, model)
 	if _, ok := b.entries[key]; !ok {
-		return
+		return false
 	}
 	delete(b.entries, key)
 	_ = b.persistLocked()
 	b.log("BREAKER CLOSED %s (probe succeeded)", model)
+	return true
 }
 
-func (b *Breaker) ReOpenFromProbe(upstream, model, reason string, until time.Time, now time.Time) {
-	b.Open(upstream, model, reason, until, now)
+func (b *Breaker) ReOpenFromProbe(upstream, model, reason string, until time.Time, now time.Time) bool {
+	return b.Open(upstream, model, reason, until, now)
+}
+
+// RoutingProvider returns a coarse hint for UIs: "glm" if any entry is OPEN,
+// "probe" if any is PROBE and none OPEN, otherwise "anthropic".
+func (b *Breaker) RoutingProvider() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	probe := false
+	for _, e := range b.entries {
+		switch e.State {
+		case Open:
+			return "glm"
+		case Probe:
+			probe = true
+		}
+	}
+	if probe {
+		return "probe"
+	}
+	return "anthropic"
 }
 
 func (b *Breaker) Snapshot() Snapshot {

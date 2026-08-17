@@ -13,11 +13,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pedro-mueller/conduit/internal/announce"
 	"github.com/pedro-mueller/conduit/internal/breaker"
 	"github.com/pedro-mueller/conduit/internal/capture"
 	"github.com/pedro-mueller/conduit/internal/classify"
 	"github.com/pedro-mueller/conduit/internal/config"
 	"github.com/pedro-mueller/conduit/internal/metrics"
+	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/redact"
 )
 
@@ -75,6 +77,7 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := metrics.StatusResponse{
 		Listen:  g.cfg.Listen,
+		Routing: g.breaker.RoutingProvider(),
 		Breaker: g.breaker.Snapshot(),
 		Counts:  g.metrics.Snapshot(),
 		Upstream: map[string]string{
@@ -142,13 +145,17 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 				g.cfg.Breaker.ProactiveThreshold,
 				g.cfg.Breaker.ProactiveUtilization,
 			); ok {
-				g.breaker.Open(anthropicUpstream, model, "proactive_"+reason, until, time.Now())
+				if g.breaker.Open(anthropicUpstream, model, "proactive_"+reason, until, time.Now()) {
+					notify.FailoverToGLM(model, "proactive_"+reason)
+				}
 			}
 			if isProbe {
-				g.breaker.Close(anthropicUpstream, model, time.Now())
+				if g.breaker.Close(anthropicUpstream, model, time.Now()) {
+					notify.BackToAnthropic(model)
+				}
 			}
 			g.metrics.IncAnthropic()
-			g.writeUpstream(w, resp, respBody, peeked)
+			g.writeUpstream(w, resp, respBody, "anthropic", false)
 			g.logRequest(r, model, "anthropic", resp.StatusCode, start, false)
 			return
 		}
@@ -158,7 +165,9 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 
 		switch class.Kind {
 		case classify.Quota:
-			g.breaker.Open(anthropicUpstream, model, class.Reason, class.Until, time.Now())
+			if g.breaker.Open(anthropicUpstream, model, class.Reason, class.Until, time.Now()) {
+				notify.FailoverToGLM(model, class.Reason)
+			}
 			_ = resp.Body.Close()
 			// Pre-stream (or non-stream) failover: client has not seen bytes yet
 			// because we buffered the error body before writing.
@@ -170,7 +179,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			// Mid-stream: already copied error? Shouldn't happen — we only peek
 			// non-2xx before writing. If peeked somehow, surface.
 			g.metrics.IncAnthropic()
-			g.writeUpstream(w, resp, respBody, false)
+			g.writeUpstream(w, resp, respBody, "anthropic", false)
 			g.logRequest(r, model, "anthropic", resp.StatusCode, start, false)
 			return
 
@@ -185,7 +194,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 				// state so a later request can try again, or close on next success.
 			}
 			g.metrics.IncAnthropic()
-			g.writeUpstream(w, resp, respBody, false)
+			g.writeUpstream(w, resp, respBody, "anthropic", false)
 			g.logRequest(r, model, "anthropic", resp.StatusCode, start, false)
 			return
 		}
@@ -193,7 +202,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 
 	if lastResp != nil {
 		g.metrics.IncAnthropic()
-		g.writeUpstream(w, lastResp, lastBody, false)
+		g.writeUpstream(w, lastResp, lastBody, "anthropic", false)
 		g.logRequest(r, model, "anthropic", lastResp.StatusCode, start, false)
 		return
 	}
@@ -218,7 +227,7 @@ func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, 
 		rewritten = body
 	}
 
-	resp, respBody, peeked, err := g.roundTrip("glm", g.cfg.GLM.BaseURL, r, rewritten, true, glmModel)
+	resp, respBody, _, err := g.roundTrip("glm", g.cfg.GLM.BaseURL, r, rewritten, true, glmModel)
 	if err != nil {
 		http.Error(w, redact.String(err.Error()), http.StatusBadGateway)
 		g.logRequest(r, model, "glm", 502, start, failover)
@@ -228,7 +237,10 @@ func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, 
 		_ = g.capture.Write(capture.FromResponse("glm", r.Method, r.URL.Path, glmModel, resp.StatusCode, resp.Header, respBody, "glm_error"))
 	}
 	g.metrics.IncGLM()
-	g.writeUpstream(w, resp, respBody, peeked)
+	// Chat notice on the failover turn (and only when enabled) so Claude Code
+	// surfaces the switch inside the conversation.
+	announceChat := failover && notify.ChatNoticeEnabled() && resp.StatusCode >= 200 && resp.StatusCode < 300
+	g.writeUpstream(w, resp, respBody, "glm", announceChat)
 	g.logRequest(r, model, "glm", resp.StatusCode, start, failover)
 }
 
@@ -302,20 +314,44 @@ func (g *Gateway) roundTrip(provider, baseURL string, r *http.Request, body []by
 
 // writeUpstream copies resp to the client. If bodyBuf is non-nil it is used
 // instead of resp.Body (already-buffered error). For live streams, bodyBuf is nil.
-func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, bodyBuf []byte, _ bool) {
+// When chatNotice is true, a one-shot GLM failover notice is injected into the
+// first assistant text so it appears inside Claude Code.
+func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, bodyBuf []byte, provider string, chatNotice bool) {
 	defer resp.Body.Close()
+
+	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+
+	// Non-SSE success bodies are streamed live; buffer them when we need to inject.
+	if chatNotice && !isSSE && bodyBuf == nil {
+		buf, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if err == nil {
+			bodyBuf = announce.InjectJSON(buf, announce.DefaultNotice)
+		} else {
+			bodyBuf = buf
+		}
+	} else if chatNotice && bodyBuf != nil && !isSSE {
+		bodyBuf = announce.InjectJSON(bodyBuf, announce.DefaultNotice)
+	}
 
 	for k, vals := range resp.Header {
 		lk := strings.ToLower(k)
 		if lk == "connection" || lk == "keep-alive" || lk == "transfer-encoding" || lk == "proxy-connection" {
 			continue
 		}
+		// Body length may change after notice injection.
+		if chatNotice && lk == "content-length" {
+			continue
+		}
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Set("X-Conduit-Provider", provider)
+	if chatNotice {
+		w.Header().Set("X-Conduit-Notice", "glm-failover")
+	}
 	// Disable buffering for SSE where possible.
-	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+	if isSSE {
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.Header().Set("Cache-Control", "no-cache")
 	}
@@ -328,6 +364,9 @@ func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, body
 		src = bytes.NewReader(bodyBuf)
 	} else {
 		src = resp.Body
+	}
+	if chatNotice && isSSE {
+		src = announce.NewSSEInjector(src, announce.DefaultNotice)
 	}
 
 	buf := make([]byte, 32*1024)

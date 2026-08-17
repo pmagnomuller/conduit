@@ -40,3 +40,8 @@ capture_path = "~/.local/state/conduit/upstream-errors.jsonl"
 # Breaker persistence. Empty = $XDG_STATE_HOME/conduit/state.json
 # (or ~/.local/state/conduit/state.json).
 state_path = ""
+
+# Notifications when failing over to GLM (env toggles; no TOML keys required):
+# - macOS/Linux desktop toast (disable with CONDUIT_DESKTOP_NOTIFY=0)
+# - one-shot chat notice inside Claude Code on the failover reply
+#   (disable with CONDUIT_CHAT_NOTICE=0; disable both with CONDUIT_NOTIFY=0)

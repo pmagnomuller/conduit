@@ -20,6 +20,7 @@ import (
 	"github.com/pedro-mueller/conduit/internal/capture"
 	"github.com/pedro-mueller/conduit/internal/config"
 	"github.com/pedro-mueller/conduit/internal/metrics"
+	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/proxy"
 	"github.com/pedro-mueller/conduit/internal/redact"
 )
@@ -41,6 +42,9 @@ type fakeUpstreams struct {
 
 func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Breaker, string) {
 	t.Helper()
+	t.Setenv("CONDUIT_DESKTOP_NOTIFY", "0")
+	t.Setenv("CONDUIT_ROUTE_PATH", filepath.Join(t.TempDir(), "route.json"))
+	notify.SetEnabledFromEnv()
 	anth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.anthropicHits.Add(1)
 		f.mu.Lock()
@@ -178,7 +182,9 @@ func TestPreStream429FailsoverToGLM(t *testing.T) {
 		w.WriteHeader(429)
 		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}`))
 	}
-	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"glm-5.2\"}}\n\n"
+	sse := "" +
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"glm-5.2\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
 	f.glm = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
@@ -193,9 +199,19 @@ func TestPreStream429FailsoverToGLM(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status=%d body=%s", res.StatusCode, got)
 	}
-	if string(got) != sse {
-		t.Fatalf("client sse=%q", got)
+	if res.Header.Get("X-Conduit-Provider") != "glm" {
+		t.Fatalf("provider header=%q", res.Header.Get("X-Conduit-Provider"))
 	}
+	if res.Header.Get("X-Conduit-Notice") != "glm-failover" {
+		t.Fatalf("notice header=%q", res.Header.Get("X-Conduit-Notice"))
+	}
+	if !bytes.Contains(got, []byte("[conduit] Switched to GLM")) {
+		t.Fatalf("expected chat notice in sse, got=%s", got)
+	}
+	if !bytes.Contains(got, []byte("hi")) {
+		t.Fatalf("missing upstream text: %s", got)
+	}
+	_ = dir
 	if f.glmHits.Load() != 1 {
 		t.Fatalf("glm hits=%d", f.glmHits.Load())
 	}

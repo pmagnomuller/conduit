@@ -58,8 +58,9 @@ func (c *Counters) Snapshot() Counters {
 }
 
 type StatusResponse struct {
-	Listen   string                    `json:"listen"`
-	Breaker  breaker.Snapshot          `json:"breaker"`
-	Counts   Counters                  `json:"counts"`
-	Upstream map[string]string         `json:"upstream"`
+	Listen   string            `json:"listen"`
+	Routing  string            `json:"routing"` // anthropic | glm | probe
+	Breaker  breaker.Snapshot  `json:"breaker"`
+	Counts   Counters          `json:"counts"`
+	Upstream map[string]string `json:"upstream"`
 }
