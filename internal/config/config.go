@@ -117,6 +117,7 @@ func Load(path string) (Config, error) {
 	}
 
 	applyEnv(&cfg)
+	loadDotEnvFile(filepath.Join(filepath.Dir(path), ".env"))
 
 	if cfg.GLM.ModelMap == nil {
 		cfg.GLM.ModelMap = map[string]string{}
@@ -128,7 +129,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg.ZAIAPIKey = os.Getenv(keyEnv)
 	if cfg.ZAIAPIKey == "" {
-		return Config{}, fmt.Errorf("%s is unset — set it to your Z.ai API key before starting the gateway", keyEnv)
+		return Config{}, fmt.Errorf("%s is unset — put it in %s/.env or export it before starting the gateway", keyEnv, filepath.Dir(path))
 	}
 
 	cfg.Log.CapturePath = ExpandHome(cfg.Log.CapturePath)
@@ -177,6 +178,35 @@ func ExpandHome(p string) string {
 		return filepath.Join(home, p[2:])
 	}
 	return p
+}
+
+// loadDotEnvFile sets KEY=VALUE pairs from a local .env without overriding
+// variables already present in the process environment.
+func loadDotEnvFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if os.Getenv(key) != "" {
+			continue
+		}
+		val = strings.TrimSpace(val)
+		val = strings.Trim(val, `"'`)
+		_ = os.Setenv(key, val)
+	}
 }
 
 func applyEnv(cfg *Config) {

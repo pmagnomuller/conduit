@@ -31,15 +31,15 @@ cp config.example.toml ~/.config/conduit/config.toml
 cp .env.example .env   # then put your Z.ai key in .env
 # .env is gitignored — never commit it
 
-# 3. Run (foreground)
-set -a && source .env && set +a
-./conduit -config ~/.config/conduit/config.toml
+# 3. One-shot install (macOS LaunchAgent at login)
+./setup.sh
+# starts now, restarts if it dies, starts again on login
+# logs: tail -f ~/.local/state/conduit/gateway.log
+# stop: launchctl bootout gui/$(id -u)/com.pedro.conduit
 
-# Or background:
-# mkdir -p ~/.local/state/conduit
-# nohup ./conduit -config ~/.config/conduit/config.toml \
-#   >~/.local/state/conduit/gateway.log 2>&1 &
-# echo $! > ~/.local/state/conduit/gateway.pid
+# Or foreground:
+# set -a && source .env && set +a
+# ./conduit -config ~/.config/conduit/config.toml
 ```
 
 Point Claude Code at the gateway (new sessions). In `~/.claude/settings.json`:
@@ -124,7 +124,7 @@ rewrites only the JSON `model` field using `[glm.model_map]` / `default_model`
 
 ## Turn it off
 
-1. Stop the gateway (`kill "$(cat ~/.local/state/conduit/gateway.pid)"`).  
+1. Stop the gateway (`launchctl bootout gui/$(id -u)/com.pedro.conduit`, or `kill "$(cat ~/.local/state/conduit/gateway.pid)"` if you started it by hand).  
 2. Remove `ANTHROPIC_BASE_URL` from `~/.claude/settings.json` (or unset it).  
 3. Restart Claude Code.
 

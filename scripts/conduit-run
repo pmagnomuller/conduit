@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# LaunchAgent entrypoint: load the local Z.ai key and exec the gateway.
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/conduit"
+STATE_DIR="${HOME}/.local/state/conduit"
+BIN="${HOME}/.local/bin/conduit"
+CONFIG="${CONFIG_DIR}/config.toml"
+
+mkdir -p "$STATE_DIR"
+
+if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
+	echo "conduit-run: no .env found (expected ${CONFIG_DIR}/.env)" >&2
+	exit 1
+fi
+
+set -a
+# shellcheck disable=SC1091
+source "${CONFIG_DIR}/.env"
+set +a
+
+if [[ -z "${ZAI_API_KEY:-}" ]]; then
+	echo "conduit-run: ZAI_API_KEY is unset after sourcing .env" >&2
+	exit 1
+fi
+
+if [[ ! -x "$BIN" ]]; then
+	echo "conduit-run: missing binary ${BIN}" >&2
+	exit 1
+fi
+
+exec "$BIN" -config "$CONFIG"
