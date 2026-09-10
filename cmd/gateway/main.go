@@ -63,6 +63,7 @@ func main() {
 		"listen", cfg.Listen,
 		"anthropic", cfg.Anthropic.BaseURL,
 		"glm", cfg.GLM.BaseURL,
+		"deepseek_enabled", cfg.DeepSeekAPIKey != "",
 		"state", cfg.Paths.StatePath,
 	)
 

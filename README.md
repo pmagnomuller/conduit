@@ -2,13 +2,17 @@
 
 Local loopback HTTP gateway between **Claude Code** and two upstreams:
 
-1. **Anthropic** (Claude Code subscription OAuth) — default  
+1. **Anthropic** (Claude Code subscription OAuth) — default
 2. **GLM via Z.ai** (`https://api.z.ai/api/anthropic`) — when plan quota is exhausted
+3. **DeepSeek** (`https://api.deepseek.com/anthropic`) — optional terminal tier, when GLM itself fails
 
 While the subscription window has capacity, every request goes to Anthropic.
 When a real plan-quota signal is observed, the gateway opens a circuit breaker
 and transparently replays to GLM. When the open window expires it probes
-Anthropic again and switches back automatically.
+Anthropic again and switches back automatically. If GLM is unreachable or
+returns auth/throttle/5xx errors while the breaker is OPEN, the request is
+retried once on DeepSeek (`deepseek-chat` by default) — but only when
+`DEEPSEEK_API_KEY` is set; without the key the tier is inert.
 
 ```
 Claude Code
@@ -16,61 +20,42 @@ Claude Code
   ▼
 conduit (127.0.0.1 only)
   ├─ breaker CLOSED / PROBE → api.anthropic.com
-  └─ breaker OPEN           → api.z.ai/api/anthropic  (GLM)
+  ├─ breaker OPEN           → api.z.ai/api/anthropic  (GLM)
+  └─ GLM failed             → api.deepseek.com/anthropic  (DeepSeek, optional)
 ```
 
 ## Quick start
 
+You need [Go 1.26+](https://go.dev/dl/) and Claude Code.
+
 ```bash
-# 1. Build
-go build -o conduit ./cmd/gateway
-
-# 2. Config + secrets
-mkdir -p ~/.config/conduit ~/.local/state/conduit
-cp config.example.toml ~/.config/conduit/config.toml
-cp .env.example .env   # then put your Z.ai key in .env
-# .env is gitignored — never commit it
-
-# 3. One-shot install (macOS LaunchAgent at login)
 ./setup.sh
-# starts now, restarts if it dies, starts again on login
-# logs: tail -f ~/.local/state/conduit/gateway.log
-# stop: launchctl bootout gui/$(id -u)/com.pedro.conduit
-
-# Or foreground:
-# set -a && source .env && set +a
-# ./conduit -config ~/.config/conduit/config.toml
 ```
 
-Point Claude Code at the gateway (new sessions). In `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"
-  }
-}
-```
-
-Or for one shell only:
+It builds the binary, asks for `ZAI_API_KEY` if missing, points Claude Code at
+the gateway, and keeps conduit running (starts at login on macOS, restarts if
+it dies). Then **restart Claude Code**.
 
 ```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
-claude
+./status.sh        # health + breaker
+./stop.sh          # pause
+./start.sh         # resume
+./uninstall.sh     # stop service and un-point Claude Code
+tail -f ~/.local/state/conduit/gateway.log
 ```
 
-Keep normal Claude OAuth. Do **not** put the Z.ai key in Claude’s auth — the gateway injects it only on the GLM path.
+Already-open Claude sessions keep the old base URL until restarted.
 
-Already-running Claude sessions keep their old base URL until restarted.
+Keep normal Claude OAuth. Do **not** put the Z.ai key in Claude’s auth — the
+gateway injects it only on the GLM path.
+
+Re-run `./setup.sh` after `git pull` to rebuild and reload.
 
 ## Verify it’s working
 
 ```bash
-curl -s http://127.0.0.1:8787/_gateway/health
-# → {"ok":true}
-
-curl -s http://127.0.0.1:8787/_gateway/status | jq .
-tail -f ~/.local/state/conduit/gateway.log   # if running in background
+./status.sh
+# or: curl -s http://127.0.0.1:8787/_gateway/health
 ```
 
 After a Claude reply you should see `anthropic_requests` rise and log lines with
@@ -105,8 +90,9 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ZAI_API_KEY` | **yes** (gateway) | Z.ai API key used when routing to GLM |
-| `ANTHROPIC_BASE_URL` | for Claude Code | Set to `http://127.0.0.1:8787` |
+| `ZAI_API_KEY` | **yes** (gateway) | Z.ai API key used when routing to GLM. Stored in `~/.config/conduit/.env` |
+| `DEEPSEEK_API_KEY` | no | Enables the terminal DeepSeek tier when set. Stored in `~/.config/conduit/.env` |
+| `ANTHROPIC_BASE_URL` | for Claude Code | Set to `http://127.0.0.1:8787` by `./setup.sh` |
 | `CLAUDE_GLM_GATEWAY_CONFIG` | no | Alternate config path |
 | `CLAUDE_GLM_GATEWAY_LISTEN` | no | Override `listen` |
 | `CLAUDE_GLM_GATEWAY_STATE_PATH` | no | Breaker state file |
@@ -119,19 +105,14 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 
 Claude Code sends Anthropic model IDs. When the breaker is OPEN the gateway
 rewrites only the JSON `model` field using `[glm.model_map]` / `default_model`
-(see `config.example.toml`). Default: opus/sonnet → `glm-5.2`, haiku →
-`glm-4.5-air`.
-
-## Turn it off
-
-1. Stop the gateway (`launchctl bootout gui/$(id -u)/com.pedro.conduit`, or `kill "$(cat ~/.local/state/conduit/gateway.pid)"` if you started it by hand).  
-2. Remove `ANTHROPIC_BASE_URL` from `~/.claude/settings.json` (or unset it).  
-3. Restart Claude Code.
+(see `config.example.toml`). Default: opus/sonnet → `glm-5.3`, haiku →
+`glm-4.5-air`. The DeepSeek tier maps through `[deepseek.model_map]` /
+`default_model` the same way (`deepseek-chat` by default).
 
 ## Tests
 
 ```bash
-go test ./...
+make test
 ```
 
 ## Non-goals
