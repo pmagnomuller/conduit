@@ -125,15 +125,10 @@ func (g *Gateway) handleRoute(w http.ResponseWriter, r *http.Request) {
 
 // availableModels lists selectable upstream models per provider for the UI.
 func (g *Gateway) availableModels() map[string][]string {
-	glm := []string{"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-4.5-air"}
-	for k := range g.cfg.GLM.ModelMap {
-		glm = append(glm, k)
-	}
-	ds := []string{"deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"}
 	return map[string][]string{
 		"anthropic": {"claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"},
-		"glm":       glm,
-		"deepseek":  ds,
+		"glm":       {"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-4.5-air"},
+		"deepseek":  {"deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"},
 	}
 }
 
