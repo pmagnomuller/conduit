@@ -12,7 +12,10 @@ build_gateway
 ensure_config
 ensure_env
 patch_claude_settings
-patch_opencode_settings
+# Opt-in: CONDUIT_WIRE_OPENCODE=1 adds an OpenCode provider entry too.
+if [[ "${CONDUIT_WIRE_OPENCODE:-0}" == "1" ]]; then
+	patch_opencode_settings
+fi
 
 if is_macos; then
 	install_macos_service
