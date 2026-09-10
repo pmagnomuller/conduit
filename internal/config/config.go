@@ -15,12 +15,14 @@ type Config struct {
 	Listen    string         `toml:"listen"`
 	Anthropic AnthropicConfig `toml:"anthropic"`
 	GLM       GLMConfig      `toml:"glm"`
+	DeepSeek  DeepSeekConfig `toml:"deepseek"`
 	Breaker   BreakerConfig  `toml:"breaker"`
 	Log       LogConfig      `toml:"log"`
 	Paths     PathsConfig    `toml:"paths"`
 
 	// Resolved at load time.
-	ZAIAPIKey string `toml:"-"`
+	ZAIAPIKey      string `toml:"-"`
+	DeepSeekAPIKey string `toml:"-"`
 }
 
 type AnthropicConfig struct {
@@ -29,6 +31,16 @@ type AnthropicConfig struct {
 }
 
 type GLMConfig struct {
+	BaseURL      string            `toml:"base_url"`
+	APIKeyEnv    string            `toml:"api_key_env"`
+	DefaultModel string            `toml:"default_model"`
+	ModelMap     map[string]string `toml:"model_map"`
+}
+
+// DeepSeekConfig is the terminal failover tier behind GLM. Anthropic-compatible
+// endpoint (https://api.deepseek.com/anthropic). The tier is enabled only when
+// the resolved API key is non-empty; otherwise it is silently skipped.
+type DeepSeekConfig struct {
 	BaseURL      string            `toml:"base_url"`
 	APIKeyEnv    string            `toml:"api_key_env"`
 	DefaultModel string            `toml:"default_model"`
@@ -62,15 +74,21 @@ func Default() Config {
 		GLM: GLMConfig{
 			BaseURL:      "https://api.z.ai/api/anthropic",
 			APIKeyEnv:    "ZAI_API_KEY",
-			DefaultModel: "glm-5.2",
+			DefaultModel: "glm-5.3",
 			ModelMap: map[string]string{
-				"claude-opus-5":              "glm-5.2",
-				"claude-sonnet-5":            "glm-5.2",
-				"claude-haiku-4-5":           "glm-4.5-air",
-				"claude-opus-4-6":            "glm-5.2",
-				"claude-sonnet-4-6":          "glm-5.2",
-				"claude-haiku-4-5-20251001":  "glm-4.5-air",
+				"claude-opus-5":              "glm-5.3",
+				"claude-sonnet-5":            "glm-5.3",
+				"claude-haiku-4-5":           "glm-5.3-flash",
+				"claude-opus-4-6":            "glm-5.3",
+				"claude-sonnet-4-6":          "glm-5.3",
+				"claude-haiku-4-5-20251001":  "glm-5.3-flash",
 			},
+		},
+		DeepSeek: DeepSeekConfig{
+			BaseURL:      "https://api.deepseek.com/anthropic",
+			APIKeyEnv:    "DEEPSEEK_API_KEY",
+			DefaultModel: "deepseek-v4-flash",
+			ModelMap:     map[string]string{},
 		},
 		Breaker: BreakerConfig{
 			FallbackOpenSeconds:  300,
@@ -122,6 +140,9 @@ func Load(path string) (Config, error) {
 	if cfg.GLM.ModelMap == nil {
 		cfg.GLM.ModelMap = map[string]string{}
 	}
+	if cfg.DeepSeek.ModelMap == nil {
+		cfg.DeepSeek.ModelMap = map[string]string{}
+	}
 
 	keyEnv := cfg.GLM.APIKeyEnv
 	if keyEnv == "" {
@@ -131,6 +152,12 @@ func Load(path string) (Config, error) {
 	if cfg.ZAIAPIKey == "" {
 		return Config{}, fmt.Errorf("%s is unset — put it in %s/.env or export it before starting the gateway", keyEnv, filepath.Dir(path))
 	}
+
+	dsKeyEnv := cfg.DeepSeek.APIKeyEnv
+	if dsKeyEnv == "" {
+		dsKeyEnv = "DEEPSEEK_API_KEY"
+	}
+	cfg.DeepSeekAPIKey = os.Getenv(dsKeyEnv)
 
 	cfg.Log.CapturePath = ExpandHome(cfg.Log.CapturePath)
 	cfg.Paths.StatePath = ExpandHome(cfg.Paths.StatePath)
@@ -155,6 +182,9 @@ func Load(path string) (Config, error) {
 func LoadForTest(path string) (Config, error) {
 	if os.Getenv("ZAI_API_KEY") == "" {
 		_ = os.Setenv("ZAI_API_KEY", "test-zai-key-not-real")
+	}
+	if os.Getenv("DEEPSEEK_API_KEY") == "" {
+		_ = os.Setenv("DEEPSEEK_API_KEY", "test-deepseek-key-not-real")
 	}
 	return Load(path)
 }
@@ -254,17 +284,26 @@ func (c Config) FallbackOpenDuration() time.Duration {
 
 // MapModel returns the GLM model ID for an Anthropic model ID.
 func (c Config) MapModel(anthropicModel string) (string, bool) {
-	if m, ok := c.GLM.ModelMap[anthropicModel]; ok && m != "" {
+	return mapModel(c.GLM.DefaultModel, c.GLM.ModelMap, anthropicModel)
+}
+
+// MapModelDeepSeek returns the DeepSeek model ID for an Anthropic model ID.
+func (c Config) MapModelDeepSeek(anthropicModel string) (string, bool) {
+	return mapModel(c.DeepSeek.DefaultModel, c.DeepSeek.ModelMap, anthropicModel)
+}
+
+func mapModel(defaultModel string, mm map[string]string, anthropicModel string) (string, bool) {
+	if m, ok := mm[anthropicModel]; ok && m != "" {
 		return m, true
 	}
 	// Prefix / fuzzy: if exact miss, try longest prefix match on known keys.
-	for k, v := range c.GLM.ModelMap {
+	for k, v := range mm {
 		if strings.HasPrefix(anthropicModel, k) && v != "" {
 			return v, true
 		}
 	}
-	if c.GLM.DefaultModel != "" {
-		return c.GLM.DefaultModel, true
+	if defaultModel != "" {
+		return defaultModel, true
 	}
 	return "", false
 }
