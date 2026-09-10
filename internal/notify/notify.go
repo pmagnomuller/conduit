@@ -27,11 +27,14 @@ func RouteFile() string {
 }
 
 type Route struct {
-	Provider string    `json:"provider"` // anthropic | glm
+	Provider string    `json:"provider"` // anthropic | glm | deepseek
 	Model    string    `json:"model,omitempty"`
-	Reason   string    `json:"reason,omitempty"`
-	At       time.Time `json:"at"`
-	Notice   string    `json:"notice,omitempty"` // short human string for statusline
+	// UpstreamModel is the rewritten model actually sent to the provider
+	// (e.g. glm-5.2, deepseek-v4-flash); equals Model on the anthropic path.
+	UpstreamModel string    `json:"upstream_model,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	At            time.Time `json:"at"`
+	Notice        string    `json:"notice,omitempty"` // short human string for statusline
 }
 
 var (
@@ -40,6 +43,8 @@ var (
 	chatOn   = true
 	writeFn  = writeRouteFile
 	notifyFn = desktopNotify
+
+	lastDeepSeekToast time.Time
 )
 
 // SetEnabled controls desktop notifications and chat notice injection.
@@ -61,19 +66,43 @@ func SetEnabledFromEnv() {
 func ChatNoticeEnabled() bool { return chatOn }
 
 // FailoverToGLM records GLM routing and fires a one-shot desktop notification.
-func FailoverToGLM(model, reason string) {
+func FailoverToGLM(model, upstreamModel, reason string) {
 	mu.Lock()
 	defer mu.Unlock()
 	notice := fmt.Sprintf("GLM · %s", shortReason(reason))
 	_ = writeFn(Route{
-		Provider: "glm",
-		Model:    model,
-		Reason:   reason,
-		At:       time.Now().UTC(),
-		Notice:   notice,
+		Provider:      "glm",
+		Model:         model,
+		UpstreamModel: upstreamModel,
+		Reason:        reason,
+		At:            time.Now().UTC(),
+		Notice:        notice,
 	})
 	if desktop {
-		msg := fmt.Sprintf("Switched to GLM (Z.ai)\nmodel=%s\n%s", model, reason)
+		msg := fmt.Sprintf("Switched to GLM (Z.ai)\nmodel=%s\n%s", upstreamModel, reason)
+		notifyFn("conduit", msg)
+	}
+}
+
+// FailoverToDeepSeek records DeepSeek routing. Unlike the GLM path there is no
+// breaker gating it, so the desktop toast is throttled to one per 5 minutes to
+// avoid spamming while GLM is hard-down. The route file is written every time.
+func FailoverToDeepSeek(model, upstreamModel, reason string) {
+	mu.Lock()
+	defer mu.Unlock()
+	now := time.Now().UTC()
+	notice := fmt.Sprintf("DeepSeek · %s", shortReason(reason))
+	_ = writeFn(Route{
+		Provider:      "deepseek",
+		Model:         model,
+		UpstreamModel: upstreamModel,
+		Reason:        reason,
+		At:            now,
+		Notice:        notice,
+	})
+	if desktop && now.Sub(lastDeepSeekToast) > 5*time.Minute {
+		lastDeepSeekToast = now
+		msg := fmt.Sprintf("Switched to DeepSeek (GLM failed)\nmodel=%s\n%s", upstreamModel, reason)
 		notifyFn("conduit", msg)
 	}
 }
@@ -83,10 +112,11 @@ func BackToAnthropic(model string) {
 	mu.Lock()
 	defer mu.Unlock()
 	_ = writeFn(Route{
-		Provider: "anthropic",
-		Model:    model,
-		At:       time.Now().UTC(),
-		Notice:   "Anthropic",
+		Provider:      "anthropic",
+		Model:         model,
+		UpstreamModel: model,
+		At:            time.Now().UTC(),
+		Notice:        "Anthropic",
 	})
 }
 

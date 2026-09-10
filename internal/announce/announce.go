@@ -10,6 +10,9 @@ import (
 // Notice is prepended to the first assistant text so it appears inside Claude Code.
 const DefaultNotice = "[conduit] Switched to GLM (Z.ai) — Anthropic plan quota is open. This reply is served by GLM.\n\n"
 
+// DeepSeekNotice is used when the terminal DeepSeek tier serves the reply.
+const DeepSeekNotice = "[conduit] Switched to DeepSeek — Anthropic quota is open and GLM failed. This reply is served by DeepSeek.\n\n"
+
 // InjectJSON prepends notice to the first text content block of a Messages API body.
 func InjectJSON(body []byte, notice string) []byte {
 	if len(body) == 0 || notice == "" {
