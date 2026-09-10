@@ -6,12 +6,16 @@
 	<string>com.pedro.conduit</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>@HOME@/.local/bin/conduit-run</string>
+		<string>@HOME@/.local/bin/conduit</string>
+		<string>-config</string>
+		<string>@HOME@/.config/conduit/config.toml</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>WorkingDirectory</key>

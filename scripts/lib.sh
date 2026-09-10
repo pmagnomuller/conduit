@@ -21,6 +21,9 @@ PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOGFILE="${STATE_DIR}/gateway.log"
 KEY_PROMPT="Paste your Z.ai API key (input hidden)"
 KEY_EMPTY_HINT="Re-run ./setup.sh after putting ZAI_API_KEY in ${ENV_FILE}"
+# Optional: launchd label of another gateway that must not share :8787.
+# Export CONDUIT_OTHER_GATEWAY_LABEL to have setup stop it before install.
+OTHER_LABEL="${CONDUIT_OTHER_GATEWAY_LABEL:-}"
 
 ensure_go() {
 	if command -v go >/dev/null 2>&1; then
@@ -66,7 +69,21 @@ ensure_env() {
 
 	# shellcheck disable=SC1090
 	set -a && source "$ENV_FILE" && set +a
+	if [[ -z "${ZAI_API_KEY:-}" && -f "${ROOT}/.env" ]]; then
+		# shellcheck disable=SC1091
+		set -a && source "${ROOT}/.env" && set +a
+		if [[ -n "${ZAI_API_KEY:-}" ]]; then
+			printf 'ZAI_API_KEY=%s\n' "$ZAI_API_KEY" >"$ENV_FILE"
+			chmod 600 "$ENV_FILE"
+			echo "Copied ZAI_API_KEY into $ENV_FILE"
+		fi
+	fi
 	if [[ -n "${ZAI_API_KEY:-}" ]]; then
+		if ! grep -q '^ZAI_API_KEY=.' "$ENV_FILE" 2>/dev/null; then
+			printf 'ZAI_API_KEY=%s\n' "$ZAI_API_KEY" >"$ENV_FILE"
+			chmod 600 "$ENV_FILE"
+			echo "Saved ZAI_API_KEY to $ENV_FILE"
+		fi
 		return 0
 	fi
 	if [[ ! -t 0 ]]; then
@@ -166,13 +183,26 @@ install_macos_service() {
 		return 1
 	fi
 	sed "s|@HOME@|${HOME}|g" "$PLIST_SRC" >"$PLIST_DST"
-	install -m 755 "${ROOT}/scripts/conduit-run" "${BIN_DIR}/conduit-run"
 	local domain
 	domain="$(launch_domain)"
+	if [[ -n "${OTHER_LABEL:-}" ]] && launchctl print "${domain}/${OTHER_LABEL}" >/dev/null 2>&1; then
+		launchctl bootout "${domain}/${OTHER_LABEL}" >/dev/null 2>&1 || true
+		echo "Stopped ${OTHER_LABEL} (only one gateway can bind :8787)"
+	fi
 	if launchctl print "${domain}/${LABEL}" >/dev/null 2>&1; then
 		launchctl bootout "${domain}/${LABEL}" >/dev/null 2>&1 || true
+		local i
+		for i in 1 2 3 4 5 6 7 8 9 10; do
+			if ! launchctl print "${domain}/${LABEL}" >/dev/null 2>&1; then
+				break
+			fi
+			sleep 0.2
+		done
 	fi
-	launchctl bootstrap "$domain" "$PLIST_DST"
+	if ! launchctl bootstrap "$domain" "$PLIST_DST"; then
+		sleep 0.5
+		launchctl bootstrap "$domain" "$PLIST_DST"
+	fi
 	launchctl enable "${domain}/${LABEL}"
 	launchctl kickstart -k "${domain}/${LABEL}"
 	echo "Installed ${LABEL} (starts at login, restarts if it dies)"
@@ -221,13 +251,13 @@ start_service() {
 		domain="$(launch_domain)"
 		if [[ ! -f "$PLIST_DST" ]]; then
 			install_macos_service
-			return
+		else
+			if ! launchctl print "${domain}/${LABEL}" >/dev/null 2>&1; then
+				launchctl bootstrap "$domain" "$PLIST_DST"
+				launchctl enable "${domain}/${LABEL}"
+			fi
+			launchctl kickstart -k "${domain}/${LABEL}"
 		fi
-		if ! launchctl print "${domain}/${LABEL}" >/dev/null 2>&1; then
-			launchctl bootstrap "$domain" "$PLIST_DST"
-			launchctl enable "${domain}/${LABEL}"
-		fi
-		launchctl kickstart -k "${domain}/${LABEL}"
 	else
 		start_nohup
 	fi
