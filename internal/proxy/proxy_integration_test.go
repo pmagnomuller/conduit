@@ -106,6 +106,7 @@ func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Brea
 		"claude-haiku-4-5": "glm-5.3-flash",
 	}
 	cfg.ZAIAPIKey = "zai-test-key-secret"
+	cfg.LocalToken = "conduit-local"
 	if f.enableDeepSeek {
 		cfg.DeepSeek.BaseURL = deepseek.URL
 		cfg.DeepSeek.DefaultModel = "deepseek-v4-flash"
@@ -736,6 +737,45 @@ func TestRouteEndpointForceAndClear(t *testing.T) {
 	defer bad.Body.Close()
 	if bad.StatusCode != 400 {
 		t.Fatalf("invalid provider accepted: %d", bad.StatusCode)
+	}
+}
+
+func TestLocalTokenRoutesToGLMWithBreakerClosed(t *testing.T) {
+	f := &fakeUpstreams{}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"ok":"anthropic"}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"ok":"glm"}`))
+	}
+
+	srv, _, _ := newGateway(t, f)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages",
+		strings.NewReader(`{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer conduit-local")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status=%d", res.StatusCode)
+	}
+	if f.glmHits.Load() != 1 || f.anthropicHits.Load() != 0 {
+		t.Fatalf("glm=%d anthropic=%d", f.glmHits.Load(), f.anthropicHits.Load())
+	}
+
+	// OAuth-style traffic must keep the automatic path.
+	res2 := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res2.Body.Close()
+	if f.anthropicHits.Load() != 1 {
+		t.Fatalf("oauth traffic should hit anthropic, got %d", f.anthropicHits.Load())
 	}
 }
 

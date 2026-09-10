@@ -203,6 +203,24 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Token-less clients (OpenCode etc.) carry a marker credential instead of
+	// Claude OAuth; they cannot authenticate against Anthropic directly, so
+	// route them straight to their configured provider.
+	if g.usesLocalToken(r) {
+		switch g.cfg.LocalTokenProvider {
+		case "deepseek":
+			if g.tryDeepSeek(w, r, body, model, start, false, "local_token") {
+				return
+			}
+		case "anthropic":
+			g.serveAnthropic(w, r, body, model, start, false)
+			return
+		default:
+			g.serveGLM(w, r, body, model, start, false)
+			return
+		}
+	}
+
 	state := g.breaker.Decide(anthropicUpstream, model, time.Now())
 
 	switch state {
@@ -358,6 +376,21 @@ func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, 
 	announceChat := failover && notify.ChatNoticeEnabled() && resp.StatusCode >= 200 && resp.StatusCode < 300
 	g.writeUpstream(w, resp, respBody, "glm", announceChat, announce.DefaultNotice)
 	g.logRequest(r, model, glmModel, "glm", resp.StatusCode, start, failover)
+}
+
+// usesLocalToken reports whether the inbound credential is the local marker
+// token rather than a real (OAuth) Anthropic credential.
+func (g *Gateway) usesLocalToken(r *http.Request) bool {
+	tok := g.cfg.LocalToken
+	if tok == "" {
+		return false
+	}
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		if r.Header.Get("Authorization") == "Bearer "+tok {
+			return true
+		}
+	}
+	return r.Header.Get("X-Api-Key") == tok
 }
 
 // glmModelFor resolves the upstream GLM model for route/notify purposes;

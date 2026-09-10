@@ -23,6 +23,13 @@ type Config struct {
 	// Resolved at load time.
 	ZAIAPIKey      string `toml:"-"`
 	DeepSeekAPIKey string `toml:"-"`
+
+	// Local-token routing: inbound requests whose credential matches
+	// LocalToken bypass Anthropic and go straight to LocalTokenProvider.
+	// Lets token-less clients (e.g. OpenCode) share the gateway while
+	// Claude Code OAuth traffic keeps the automatic breaker chain.
+	LocalToken         string `toml:"-"`
+	LocalTokenProvider string `toml:"-"`
 }
 
 type AnthropicConfig struct {
@@ -158,6 +165,19 @@ func Load(path string) (Config, error) {
 		dsKeyEnv = "DEEPSEEK_API_KEY"
 	}
 	cfg.DeepSeekAPIKey = os.Getenv(dsKeyEnv)
+
+	cfg.LocalToken = os.Getenv("CONDUIT_LOCAL_TOKEN")
+	if cfg.LocalToken == "" {
+		cfg.LocalToken = "conduit-local"
+	}
+	cfg.LocalTokenProvider = os.Getenv("CONDUIT_LOCAL_PROVIDER")
+	switch cfg.LocalTokenProvider {
+	case "", "glm":
+		cfg.LocalTokenProvider = "glm"
+	case "deepseek", "anthropic":
+	default:
+		return Config{}, fmt.Errorf("CONDUIT_LOCAL_PROVIDER must be glm, deepseek, or anthropic (got %q)", cfg.LocalTokenProvider)
+	}
 
 	cfg.Log.CapturePath = ExpandHome(cfg.Log.CapturePath)
 	cfg.Paths.StatePath = ExpandHome(cfg.Paths.StatePath)
