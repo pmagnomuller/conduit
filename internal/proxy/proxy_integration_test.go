@@ -30,14 +30,20 @@ const fakeToken = "sk-ant-secret-token-DO-NOT-LEAK-abc123"
 type fakeUpstreams struct {
 	anthropicHits atomic.Int32
 	glmHits       atomic.Int32
+	deepSeekHits  atomic.Int32
 
 	anthropic http.HandlerFunc
 	glm       http.HandlerFunc
+	deepseek  http.HandlerFunc
 
-	mu            sync.Mutex
-	glmBodies     [][]byte
-	anthropicAuth []string
-	glmAuth       []string
+	enableDeepSeek bool
+
+	mu             sync.Mutex
+	glmBodies      [][]byte
+	deepSeekBodies [][]byte
+	anthropicAuth  []string
+	glmAuth        []string
+	deepSeekAuth   []string
 }
 
 func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Breaker, string) {
@@ -63,6 +69,21 @@ func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Brea
 	}))
 	t.Cleanup(anth.Close)
 	t.Cleanup(glm.Close)
+	deepseek := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.deepSeekHits.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.deepSeekBodies = append(f.deepSeekBodies, body)
+		f.deepSeekAuth = append(f.deepSeekAuth, r.Header.Get("Authorization"))
+		f.mu.Unlock()
+		if f.deepseek != nil {
+			f.deepseek(w, r)
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(deepseek.Close)
 
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
@@ -79,12 +100,17 @@ func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Brea
 	cfg.Anthropic.BaseURL = anth.URL
 	cfg.Anthropic.MaxTransientRetries = 2
 	cfg.GLM.BaseURL = glm.URL
-	cfg.GLM.DefaultModel = "glm-5.2"
+	cfg.GLM.DefaultModel = "glm-5.3"
 	cfg.GLM.ModelMap = map[string]string{
-		"claude-opus-5": "glm-5.2",
-		"claude-haiku-4-5": "glm-4.5-air",
+		"claude-opus-5": "glm-5.3",
+		"claude-haiku-4-5": "glm-5.3-flash",
 	}
 	cfg.ZAIAPIKey = "zai-test-key-secret"
+	if f.enableDeepSeek {
+		cfg.DeepSeek.BaseURL = deepseek.URL
+		cfg.DeepSeek.DefaultModel = "deepseek-v4-flash"
+		cfg.DeepSeekAPIKey = "deepseek-test-key-secret"
+	}
 	cfg.Paths.StatePath = statePath
 	cfg.Log.CapturePath = capturePath
 	cfg.Log.CaptureUpstreamErrors = true
@@ -228,7 +254,7 @@ func TestPreStream429FailsoverToGLM(t *testing.T) {
 	if err := json.Unmarshal(f.glmBodies[0], &m); err != nil {
 		t.Fatal(err)
 	}
-	if m["model"] != "glm-5.2" {
+	if m["model"] != "glm-5.3" {
 		t.Fatalf("model rewrite=%v", m["model"])
 	}
 	if !strings.HasPrefix(f.glmAuth[0], "Bearer zai-test-key") {
@@ -430,7 +456,7 @@ func TestModelRewriteOnlyOnGLM(t *testing.T) {
 	if len(f.glmBodies) == 0 {
 		t.Fatal("no glm body")
 	}
-	if !bytes.Contains(f.glmBodies[0], []byte(`"glm-5.2"`)) {
+	if !bytes.Contains(f.glmBodies[0], []byte(`"glm-5.3"`)) {
 		t.Fatalf("glm body=%s", f.glmBodies[0])
 	}
 	if bytes.Contains(f.glmBodies[0], []byte(`claude-opus-5`)) {
@@ -488,6 +514,228 @@ func TestCapacityThrottle429DoesNotFailover(t *testing.T) {
 	}
 	if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Closed {
 		t.Fatalf("breaker=%s", st)
+	}
+}
+
+func TestGLMHardDownFailsOverToDeepSeek(t *testing.T) {
+	f := &fakeUpstreams{enableDeepSeek: true}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"glm down"}}`))
+	}
+	f.deepseek = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"text","text":"ds"}]}`))
+	}
+
+	srv, _, dir := newGateway(t, f)
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`)
+	res := post(t, srv.URL+"/v1/messages", reqBody, fakeToken)
+	defer res.Body.Close()
+	got, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 || !bytes.Contains(got, []byte("Switched to DeepSeek")) {
+		t.Fatalf("status=%d body=%s", res.StatusCode, got)
+	}
+	if res.Header.Get("X-Conduit-Provider") != "deepseek" {
+		t.Fatalf("provider header=%q", res.Header.Get("X-Conduit-Provider"))
+	}
+	if res.Header.Get("X-Conduit-Notice") != "deepseek-failover" {
+		t.Fatalf("notice header=%q", res.Header.Get("X-Conduit-Notice"))
+	}
+	if f.deepSeekHits.Load() != 1 {
+		t.Fatalf("deepseek hits=%d", f.deepSeekHits.Load())
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.deepSeekBodies) != 1 {
+		t.Fatal("expected one deepseek body")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "deepseek-v4-flash" {
+		t.Fatalf("model rewrite=%v", m["model"])
+	}
+	if !strings.HasPrefix(f.deepSeekAuth[0], "Bearer deepseek-test-key") {
+		t.Fatalf("deepseek auth=%q", f.deepSeekAuth[0])
+	}
+	if strings.Contains(f.deepSeekAuth[0], fakeToken) || strings.Contains(f.deepSeekAuth[0], "zai-test-key-secret") {
+		t.Fatal("upstream keys leaked to deepseek")
+	}
+
+	assertNoSecretOnDisk(t, dir, fakeToken)
+	assertNoSecretOnDisk(t, dir, "zai-test-key-secret")
+	assertNoSecretOnDisk(t, dir, "deepseek-test-key-secret")
+}
+
+func TestDeepSeekTierSkippedWhenNoKey(t *testing.T) {
+	f := &fakeUpstreams{}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}`))
+	}
+
+	srv, _, _ := newGateway(t, f)
+	res := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res.Body.Close()
+	if res.StatusCode != 503 {
+		t.Fatalf("expected glm 503 surfaced, got %d", res.StatusCode)
+	}
+	if f.deepSeekHits.Load() != 0 {
+		t.Fatalf("deepseek hits=%d", f.deepSeekHits.Load())
+	}
+}
+
+func TestGLMClientErrorDoesNotFallToDeepSeek(t *testing.T) {
+	f := &fakeUpstreams{enableDeepSeek: true}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`))
+	}
+
+	srv, _, _ := newGateway(t, f)
+	res := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res.Body.Close()
+	if res.StatusCode != 400 {
+		t.Fatalf("expected glm 400 surfaced, got %d", res.StatusCode)
+	}
+	if f.deepSeekHits.Load() != 0 {
+		t.Fatalf("deepseek hits=%d", f.deepSeekHits.Load())
+	}
+}
+
+func TestForcedGLMBypassesAnthropicAndOverridesModel(t *testing.T) {
+	f := &fakeUpstreams{}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		t.Error("anthropic must not be called while glm is forced")
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"ok":"glm"}`))
+	}
+
+	srv, br, _ := newGateway(t, f)
+	br.SetForce("glm", "glm-5.3-flash")
+
+	res := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 || !bytes.Contains(body, []byte("glm")) {
+		t.Fatalf("status=%d body=%s", res.StatusCode, body)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var m map[string]any
+	if err := json.Unmarshal(f.glmBodies[len(f.glmBodies)-1], &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "glm-5.3-flash" {
+		t.Fatalf("forced model override=%v, want glm-5.3-flash", m["model"])
+	}
+}
+
+func TestForcedAnthropicSuppressesFailover(t *testing.T) {
+	f := &fakeUpstreams{}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"ok":"glm"}`))
+	}
+
+	srv, br, _ := newGateway(t, f)
+	br.SetForce("anthropic", "")
+
+	res := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res.Body.Close()
+	if res.StatusCode != 429 {
+		t.Fatalf("expected 429 surfaced (no failover), got %d", res.StatusCode)
+	}
+	if f.glmHits.Load() != 0 {
+		t.Fatal("glm hit during forced anthropic")
+	}
+
+	br.ClearForce()
+	res2 := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res2.Body.Close()
+	if res2.StatusCode != 200 || f.glmHits.Load() != 1 {
+		t.Fatalf("after clear: status=%d glmHits=%d", res2.StatusCode, f.glmHits.Load())
+	}
+}
+
+func TestRouteEndpointForceAndClear(t *testing.T) {
+	f := &fakeUpstreams{}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }
+	f.glm = func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }
+
+	srv, _, _ := newGateway(t, f)
+
+	res, err := http.Post(srv.URL+"/_gateway/route", "application/json",
+		strings.NewReader(`{"provider":"glm","model":"glm-5.3"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 200 {
+		t.Fatalf("force status=%d", res.StatusCode)
+	}
+	res.Body.Close()
+
+	st, err := http.Get(srv.URL + "/_gateway/route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var route struct {
+		ForcedProvider string `json:"forced_provider"`
+		ForcedModel    string `json:"forced_model"`
+		Available      map[string][]string `json:"available"`
+	}
+	_ = json.NewDecoder(st.Body).Decode(&route)
+	st.Body.Close()
+	if route.ForcedProvider != "glm" || route.ForcedModel != "glm-5.3" {
+		t.Fatalf("route=%+v", route)
+	}
+	if len(route.Available["glm"]) == 0 || len(route.Available["deepseek"]) == 0 {
+		t.Fatalf("available=%v", route.Available)
+	}
+
+	res2, err := http.Post(srv.URL+"/_gateway/route", "application/json",
+		strings.NewReader(`{"clear":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2.Body.Close()
+
+	bad, err := http.Post(srv.URL+"/_gateway/route", "application/json",
+		strings.NewReader(`{"provider":"openai"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Body.Close()
+	if bad.StatusCode != 400 {
+		t.Fatalf("invalid provider accepted: %d", bad.StatusCode)
 	}
 }
 
