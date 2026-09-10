@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="conduit logo">
+  <defs>
+    <linearGradient id="flow" gradientUnits="userSpaceOnUse" x1="296" y1="256" x2="440" y2="256">
+      <stop offset="0"    stop-color="#f783ac"/>
+      <stop offset="0.5"  stop-color="#74c0fc"/>
+      <stop offset="1"    stop-color="#63e6be"/>
+    </linearGradient>
+  </defs>
+
+  <!-- tile -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="#101418" stroke="#263041" stroke-width="8"/>
+
+  <!-- provider lanes converging into the conduit -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M 72 168 H 168 Q 264 168 296 256" stroke="#f783ac" stroke-width="30"/>
+    <path d="M 72 256 H 296"                      stroke="#74c0fc" stroke-width="30"/>
+    <path d="M 72 344 H 168 Q 264 344 296 256" stroke="#63e6be" stroke-width="30"/>
+
+    <!-- merged conduit carrying all three -->
+    <path d="M 296 256 H 440" stroke="url(#flow)" stroke-width="48"/>
+  </g>
+
+  <!-- merge node -->
+  <circle cx="296" cy="256" r="26" fill="#101418" stroke="#d8dee6" stroke-width="12"/>
+</svg>

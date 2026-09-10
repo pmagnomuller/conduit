@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="128" alt="conduit logo"></p>
+
 # conduit
 
 Local loopback HTTP gateway between **Claude Code** and three upstreams:
