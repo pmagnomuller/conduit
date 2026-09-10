@@ -34,6 +34,10 @@ type LastQuotaEvent struct {
 type Snapshot struct {
 	Entries map[string]Entry `json:"entries"`
 	LastQuota *LastQuotaEvent `json:"last_quota,omitempty"`
+	// Forced routing (manual override via /_gateway/route). Empty provider
+	// means automatic breaker-driven routing.
+	ForcedProvider string `json:"forced_provider,omitempty"`
+	ForcedModel    string `json:"forced_model,omitempty"`
 }
 
 // Key identifies breaker state for an (upstream, model) pair.
@@ -50,6 +54,8 @@ type Breaker struct {
 	mu       sync.Mutex
 	entries  map[string]Entry
 	lastQuota *LastQuotaEvent
+	forcedProvider string
+	forcedModel    string
 	path     string
 	fallback time.Duration
 	probeOn  bool
@@ -91,6 +97,8 @@ func (b *Breaker) load() error {
 	}
 	b.entries = snap.Entries
 	b.lastQuota = snap.LastQuota
+	b.forcedProvider = snap.ForcedProvider
+	b.forcedModel = snap.ForcedModel
 	return nil
 }
 
@@ -101,7 +109,7 @@ func (b *Breaker) persistLocked() error {
 	if err := os.MkdirAll(filepath.Dir(b.path), 0o755); err != nil {
 		return err
 	}
-	snap := Snapshot{Entries: b.entries, LastQuota: b.lastQuota}
+	snap := Snapshot{Entries: b.entries, LastQuota: b.lastQuota, ForcedProvider: b.forcedProvider, ForcedModel: b.forcedModel}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err
@@ -239,6 +247,31 @@ func (b *Breaker) Entry(upstream, model string) (Entry, bool) {
 }
 
 func (b *Breaker) Path() string { return b.path }
+
+// SetForce pins routing to a provider ("" = automatic) with an optional model
+// override applied when that provider serves requests.
+func (b *Breaker) SetForce(provider, model string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.forcedProvider = provider
+	b.forcedModel = model
+	_ = b.persistLocked()
+	b.log("ROUTE FORCED %s %s", provider, model)
+}
+
+func (b *Breaker) ClearForce() { b.SetForce("", "") }
+
+func (b *Breaker) ForcedProvider() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.forcedProvider
+}
+
+func (b *Breaker) ForcedModel() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.forcedModel
+}
 
 // ForceOpenForTest opens without logging side effects beyond normal Open.
 func (b *Breaker) String() string {
