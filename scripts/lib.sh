@@ -16,6 +16,7 @@ CONFIG="${CONFIG_DIR}/config.toml"
 ENV_FILE="${CONFIG_DIR}/.env"
 CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 GATEWAY_URL="http://127.0.0.1:8787"
+LOCAL_TOKEN="${CONDUIT_LOCAL_TOKEN:-conduit-local}"
 PLIST_SRC="${ROOT}/contrib/macos/${LABEL}.plist"
 PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOGFILE="${STATE_DIR}/gateway.log"
@@ -139,6 +140,81 @@ if path.exists():
 env["ANTHROPIC_BASE_URL"] = url
 path.write_text(json.dumps(data, indent=2) + "\n")
 print(f"Set ANTHROPIC_BASE_URL in {path} (backup: {path.with_suffix('.json.bak')})")
+PY
+}
+
+OPENCODE_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/opencode/opencode.json"
+
+# patch_opencode_settings adds an anthropic provider entry pointing OpenCode at
+# the gateway using the local marker token (routed to GLM by default). Noop
+# when OpenCode is not installed or already points at the gateway.
+patch_opencode_settings() {
+	python3 - "$OPENCODE_CONFIG" "$GATEWAY_URL" "$LOCAL_TOKEN" <<'PY'
+import json, pathlib, sys
+
+path, url, token = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+if not path.exists():
+    print(f"No {path} — skipping OpenCode wiring")
+    sys.exit(0)
+
+try:
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("root must be an object")
+except Exception as exc:
+    print(f"Could not update {path}: {exc}", file=sys.stderr)
+    sys.exit(0)
+
+provider = data.get("provider")
+if not isinstance(provider, dict):
+    provider = {}
+    data["provider"] = provider
+
+entry = provider.get("anthropic")
+if isinstance(entry, dict) and entry.get("options", {}).get("baseURL") == url:
+    print(f"OpenCode already points at {url}")
+    sys.exit(0)
+
+if entry is not None:
+    backup = path.with_suffix(".json.bak")
+    backup.write_text(path.read_text())
+    print(f"Backed up existing anthropic provider entry to {backup}")
+
+provider["anthropic"] = {
+    "options": {"baseURL": url, "apiKey": token},
+    "models": {
+        "claude-opus-5": {},
+        "claude-sonnet-5": {},
+        "claude-haiku-4-5": {},
+    },
+}
+path.write_text(json.dumps(data, indent=2) + "\n")
+print(f"Wired OpenCode anthropic provider to {url} (local token)")
+PY
+}
+
+unpatch_opencode_settings() {
+	python3 - "$OPENCODE_CONFIG" "$GATEWAY_URL" <<'PY'
+import json, pathlib, sys
+
+path, url = pathlib.Path(sys.argv[1]), sys.argv[2]
+if not path.exists():
+    sys.exit(0)
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    sys.exit(0)
+provider = data.get("provider")
+if not isinstance(provider, dict):
+    sys.exit(0)
+entry = provider.get("anthropic")
+if not isinstance(entry, dict) or entry.get("options", {}).get("baseURL") != url:
+    sys.exit(0)
+del provider["anthropic"]
+if not provider:
+    data.pop("provider", None)
+path.write_text(json.dumps(data, indent=2) + "\n")
+print("Removed conduit anthropic provider from OpenCode")
 PY
 }
 

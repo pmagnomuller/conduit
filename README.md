@@ -34,6 +34,19 @@ Forced routing persists in `state.json` across restarts. Pinning `anthropic`
 suppresses failover (quota errors surface raw); pinning `glm`/`deepseek` pins
 every request to that provider with the model you choose.
 
+## Clients
+
+**Claude Code** — `./setup.sh` points it at the gateway
+(`ANTHROPIC_BASE_URL=127.0.0.1:8787`). It keeps its normal OAuth credential and
+rides the automatic breaker chain.
+
+**OpenCode** — `./setup.sh` also adds an `anthropic` provider entry to
+`~/.config/opencode/opencode.json` pointing at the gateway with the local
+marker token (`conduit-local`). Token-less traffic is routed straight to GLM
+(or `CONDUIT_LOCAL_PROVIDER`) since it has no Anthropic credential to forward.
+Models appear in OpenCode as `anthropic/claude-opus-5`, `claude-sonnet-5`,
+`claude-haiku-4-5`.
+
 ## Architecture
 
 ```mermaid
@@ -171,6 +184,8 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 | `CONDUIT_CHAT_NOTICE` | no | Set to `0` to disable in-chat notice |
 | `CONDUIT_DESKTOP_NOTIFY` | no | Set to `0` to disable desktop toast |
 | `CONDUIT_OTHER_GATEWAY_LABEL` | no | launchd label of another gateway to stop during setup |
+| `CONDUIT_LOCAL_TOKEN` | no | Marker credential for token-less clients (default `conduit-local`). `./setup.sh` wires OpenCode with it |
+| `CONDUIT_LOCAL_PROVIDER` | no | Provider for local-token traffic: `glm` (default), `deepseek`, or `anthropic` |
 
 ## Model mapping
 

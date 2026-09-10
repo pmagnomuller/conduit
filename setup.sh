@@ -12,6 +12,7 @@ build_gateway
 ensure_config
 ensure_env
 patch_claude_settings
+patch_opencode_settings
 
 if is_macos; then
 	install_macos_service
