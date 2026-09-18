@@ -21,6 +21,9 @@ returns auth/throttle/5xx errors while the breaker is OPEN, the request is
 retried once on DeepSeek — but only when `DEEPSEEK_API_KEY` is set; without
 the key the tier is inert.
 
+
+**Writeup:** [Conduit: keep coding when the Claude plan runs out](https://pedro-muller.com/ai/conduit/) on my blog.
+
 ## Control UI
 
 Open `http://127.0.0.1:8787/_gateway/ui` to see live routing and pin a
