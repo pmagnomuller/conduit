@@ -10,10 +10,10 @@ APP_NAME="conduit"
 LABEL="com.pedro.conduit"
 BIN_DIR="${HOME}/.local/bin"
 BIN="${BIN_DIR}/conduit"
-CONFIG_DIR="${HOME}/.config/conduit"
-STATE_DIR="${HOME}/.local/state/conduit"
+CONFIG_DIR="${CONFIG_DIR:-${HOME}/.config/conduit}"
+STATE_DIR="${STATE_DIR:-${HOME}/.local/state/conduit}"
 CONFIG="${CONFIG_DIR}/config.toml"
-ENV_FILE="${CONFIG_DIR}/.env"
+ENV_FILE="${ENV_FILE:-${CONFIG_DIR}/.env}"
 CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 GATEWAY_URL="http://127.0.0.1:8787"
 LOCAL_TOKEN="${CONDUIT_LOCAL_TOKEN:-conduit-local}"
@@ -22,6 +22,7 @@ PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOGFILE="${STATE_DIR}/gateway.log"
 KEY_PROMPT="Paste your Z.ai API key (input hidden)"
 KEY_EMPTY_HINT="Re-run ./setup.sh after putting ZAI_API_KEY in ${ENV_FILE}"
+JEV_PROMPT="TypeSafe API key for Jev routing mode (optional, Enter to skip):"
 # Optional: launchd label of another gateway that must not share :8787.
 # Export CONDUIT_OTHER_GATEWAY_LABEL to have setup stop it before install.
 OTHER_LABEL="${CONDUIT_OTHER_GATEWAY_LABEL:-}"
@@ -53,6 +54,33 @@ ensure_config() {
 	fi
 }
 
+# shell_quote VALUE — single-quote a value for ENV_FILE, which the scripts
+# source under `set -euo pipefail` and config.Load re-reads itself. Unquoted, a
+# key or value containing $ or ` was expanded when sourced (and under `set -u`
+# an unset variable aborted the read half way), which broke the next
+# ./setup.sh. config.Load trims the surrounding quotes, so both readers see the
+# same value.
+shell_quote() {
+	local v="$1"
+	printf "'%s'" "${v//\'/\'\\\'\'}"
+}
+
+# upsert_env KEY VALUE — set KEY in ENV_FILE, preserving every other line.
+# The plain `>` writes this replaces truncated the file, which dropped a
+# previously saved TYPESAFE_API_KEY (or any other key) on the next ZAI re-save.
+upsert_env() {
+	local key="$1" val="$2" tmp
+	mkdir -p "$CONFIG_DIR"
+	touch "$ENV_FILE"
+	tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+	{
+		grep -v "^${key}=" "$ENV_FILE" || true
+		printf '%s=%s\n' "$key" "$(shell_quote "$val")"
+	} >"$tmp"
+	mv "$tmp" "$ENV_FILE"
+	chmod 600 "$ENV_FILE"
+}
+
 # Copies a repo .env if present; otherwise creates from the example.
 # Prompts on a TTY when the key is still empty.
 ensure_env() {
@@ -74,15 +102,13 @@ ensure_env() {
 		# shellcheck disable=SC1091
 		set -a && source "${ROOT}/.env" && set +a
 		if [[ -n "${ZAI_API_KEY:-}" ]]; then
-			printf 'ZAI_API_KEY=%s\n' "$ZAI_API_KEY" >"$ENV_FILE"
-			chmod 600 "$ENV_FILE"
+			upsert_env ZAI_API_KEY "$ZAI_API_KEY"
 			echo "Copied ZAI_API_KEY into $ENV_FILE"
 		fi
 	fi
 	if [[ -n "${ZAI_API_KEY:-}" ]]; then
 		if ! grep -q '^ZAI_API_KEY=.' "$ENV_FILE" 2>/dev/null; then
-			printf 'ZAI_API_KEY=%s\n' "$ZAI_API_KEY" >"$ENV_FILE"
-			chmod 600 "$ENV_FILE"
+			upsert_env ZAI_API_KEY "$ZAI_API_KEY"
 			echo "Saved ZAI_API_KEY to $ENV_FILE"
 		fi
 		return 0
@@ -101,9 +127,44 @@ ensure_env() {
 		echo "$KEY_EMPTY_HINT" >&2
 		return 1
 	fi
-	printf 'ZAI_API_KEY=%s\n' "$key" >"$ENV_FILE"
-	chmod 600 "$ENV_FILE"
+	upsert_env ZAI_API_KEY "$key"
 	export ZAI_API_KEY="$key"
+}
+
+# Optional TypeSafe key enabling Jev routing mode. Prompts only on a TTY when
+# TYPESAFE_API_KEY is absent from both the environment and ENV_FILE (ensure_env
+# has already sourced it). Appends a single line, never rewrites other lines,
+# never echoes the key. CONDUIT_SKIP_JEV_PROMPT=1 skips. Idempotent: a declined
+# prompt is persisted as CONDUIT_SKIP_JEV_PROMPT=1 in ENV_FILE, so setup never
+# asks twice.
+ensure_jev_env() {
+	if [[ "${CONDUIT_SKIP_JEV_PROMPT:-0}" == "1" ]]; then
+		return 0
+	fi
+	if [[ -f "$ENV_FILE" ]] && grep -qE "^CONDUIT_SKIP_JEV_PROMPT=['\"]?1" "$ENV_FILE" 2>/dev/null; then
+		return 0
+	fi
+	if [[ -n "${TYPESAFE_API_KEY:-}" ]]; then
+		return 0
+	fi
+	if [[ -f "$ENV_FILE" ]] && grep -q '^TYPESAFE_API_KEY=.' "$ENV_FILE" 2>/dev/null; then
+		return 0
+	fi
+	if [[ ! -t 0 ]]; then
+		return 0
+	fi
+	echo "$JEV_PROMPT"
+	local key=""
+	read -r -s key
+	echo
+	if [[ -z "$key" ]]; then
+		upsert_env CONDUIT_SKIP_JEV_PROMPT 1
+		echo "Skipped. Set TYPESAFE_API_KEY in $ENV_FILE later to enable Jev mode (drop the CONDUIT_SKIP_JEV_PROMPT line to be asked again)."
+		return 0
+	fi
+	upsert_env TYPESAFE_API_KEY "$key"
+	export TYPESAFE_API_KEY="$key"
+	echo "Saved TYPESAFE_API_KEY to $ENV_FILE (Jev routing mode available)"
 }
 
 patch_claude_settings() {
@@ -373,8 +434,21 @@ wait_healthy() {
 status_service() {
 	if curl -sf "${GATEWAY_URL}/_gateway/health" >/dev/null 2>&1; then
 		echo "health: ok  (${GATEWAY_URL})"
-		curl -s "${GATEWAY_URL}/_gateway/status" 2>/dev/null || true
-		echo
+		local st
+		st="$(curl -s "${GATEWAY_URL}/_gateway/status" 2>/dev/null || true)"
+		printf '%s\n' "$st"
+		# mode / jev_enabled are newer fields; print only when present and jq exists.
+		if [[ -n "$st" ]] && command -v jq >/dev/null 2>&1; then
+			local mode jev
+			mode="$(printf '%s' "$st" | jq -r '.mode // empty' 2>/dev/null || true)"
+			jev="$(printf '%s' "$st" | jq -r 'if has("jev_enabled") then (.jev_enabled|tostring) else empty end' 2>/dev/null || true)"
+			if [[ -n "$mode" ]]; then
+				echo "mode: ${mode}"
+			fi
+			if [[ -n "$jev" ]]; then
+				echo "jev_enabled: ${jev}"
+			fi
+		fi
 	else
 		echo "health: down  (${GATEWAY_URL})"
 	fi

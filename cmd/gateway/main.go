@@ -19,6 +19,7 @@ import (
 	"github.com/pedro-mueller/conduit/internal/metrics"
 	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/proxy"
+	"github.com/pedro-mueller/conduit/internal/route"
 )
 
 func main() {
@@ -40,7 +41,8 @@ func main() {
 	})
 	cap := capture.New(cfg.Log.CapturePath, cfg.Log.CaptureUpstreamErrors)
 	met := metrics.New()
-	gw := proxy.New(cfg, br, cap, met, log)
+	router := route.New(cfg.Jev, cfg.TypeSafeAPIKey, log)
+	gw := proxy.New(cfg, br, cap, met, router, log)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -64,6 +66,8 @@ func main() {
 		"anthropic", cfg.Anthropic.BaseURL,
 		"glm", cfg.GLM.BaseURL,
 		"deepseek_enabled", cfg.DeepSeekAPIKey != "",
+		"jev_enabled", router.Enabled(),
+		"mode", string(br.Mode()),
 		"state", cfg.Paths.StatePath,
 	)
 

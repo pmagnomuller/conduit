@@ -12,17 +12,21 @@ import (
 )
 
 type Config struct {
-	Listen    string         `toml:"listen"`
+	Listen    string          `toml:"listen"`
 	Anthropic AnthropicConfig `toml:"anthropic"`
-	GLM       GLMConfig      `toml:"glm"`
-	DeepSeek  DeepSeekConfig `toml:"deepseek"`
-	Breaker   BreakerConfig  `toml:"breaker"`
-	Log       LogConfig      `toml:"log"`
-	Paths     PathsConfig    `toml:"paths"`
+	GLM       GLMConfig       `toml:"glm"`
+	DeepSeek  DeepSeekConfig  `toml:"deepseek"`
+	Breaker   BreakerConfig   `toml:"breaker"`
+	Log       LogConfig       `toml:"log"`
+	Paths     PathsConfig     `toml:"paths"`
+	Jev       JevConfig       `toml:"jev"`
 
 	// Resolved at load time.
 	ZAIAPIKey      string `toml:"-"`
 	DeepSeekAPIKey string `toml:"-"`
+	// TypeSafeAPIKey enables Jev routing mode. Optional: when empty the
+	// router reports Enabled()==false and the gateway stays in auto/pinned.
+	TypeSafeAPIKey string `toml:"-"`
 
 	// Local-token routing: inbound requests whose credential matches
 	// LocalToken bypass Anthropic and go straight to LocalTokenProvider.
@@ -71,6 +75,42 @@ type PathsConfig struct {
 	StatePath string `toml:"state_path"`
 }
 
+// JevConfig drives per-call model routing via Jev (TypeSafe System One).
+// Catalog entries are the candidates Jev may choose between; when empty the
+// built-in DefaultCatalog is used.
+type JevConfig struct {
+	BaseURL         string      `toml:"base_url"`
+	APIKeyEnv       string      `toml:"api_key_env"`
+	TimeoutMS       int         `toml:"timeout_ms"`
+	LeaseTTLSeconds int         `toml:"lease_ttl_seconds"`
+	DecisionsPath   string      `toml:"decisions_path"` // "" disables the JSONL decision log
+	Catalog         []Candidate `toml:"catalog"`
+}
+
+// Candidate is one provider/model Jev may pick. It lives here (not in
+// internal/route) so route can import config without a cycle; route aliases it.
+type Candidate struct {
+	Provider string `json:"provider" toml:"provider"` // anthropic|glm|deepseek
+	Model    string `json:"model"    toml:"model"`
+	Profile  string `json:"profile"  toml:"profile"` // capability/cost prior sent to Jev as criteria text
+}
+
+// Key is the catalog key sent to Jev, e.g. "anthropic/claude-opus-5".
+func (c Candidate) Key() string { return c.Provider + "/" + c.Model }
+
+// DefaultCatalog returns the built-in candidate set. Profiles are terse
+// priors: Jev sees them as criteria text and picks the cheapest sufficient one.
+func DefaultCatalog() []Candidate {
+	return []Candidate{
+		{Provider: "anthropic", Model: "claude-opus-5", Profile: "Hardest work: architecture, security/concurrency review, ambiguous broad tasks, multi-file debugging. Most expensive."},
+		{Provider: "anthropic", Model: "claude-sonnet-5", Profile: "Complex implementation, inferring intent, cross-file refactors, robust tests. Expensive."},
+		{Provider: "anthropic", Model: "claude-haiku-4-5", Profile: "Trivial work: titles, summaries, a single mechanical edit with a known target. Cheap on-plan."},
+		{Provider: "glm", Model: "glm-5.3", Profile: "Bounded implementation with clear requirements and known patterns. Cheap, off-plan."},
+		{Provider: "glm", Model: "glm-5.3-flash", Profile: "Mechanical follow-through, formatting, simple tool continuations. Cheapest."},
+		{Provider: "deepseek", Model: "deepseek-v4-flash", Profile: "Bounded implementation; cheap alternative to glm-5.3. Only available when DEEPSEEK_API_KEY is set."},
+	}
+}
+
 func Default() Config {
 	return Config{
 		Listen: "127.0.0.1:8787",
@@ -83,12 +123,12 @@ func Default() Config {
 			APIKeyEnv:    "ZAI_API_KEY",
 			DefaultModel: "glm-5.3",
 			ModelMap: map[string]string{
-				"claude-opus-5":              "glm-5.3",
-				"claude-sonnet-5":            "glm-5.3",
-				"claude-haiku-4-5":           "glm-5.3-flash",
-				"claude-opus-4-6":            "glm-5.3",
-				"claude-sonnet-4-6":          "glm-5.3",
-				"claude-haiku-4-5-20251001":  "glm-5.3-flash",
+				"claude-opus-5":             "glm-5.3",
+				"claude-sonnet-5":           "glm-5.3",
+				"claude-haiku-4-5":          "glm-5.3-flash",
+				"claude-opus-4-6":           "glm-5.3",
+				"claude-sonnet-4-6":         "glm-5.3",
+				"claude-haiku-4-5-20251001": "glm-5.3-flash",
 			},
 		},
 		DeepSeek: DeepSeekConfig{
@@ -107,6 +147,15 @@ func Default() Config {
 			Level:                 "info",
 			CaptureUpstreamErrors: true,
 			CapturePath:           "~/.local/state/conduit/upstream-errors.jsonl",
+		},
+		Jev: JevConfig{
+			BaseURL:         "https://api.typesafe.ai/v1/systemone",
+			APIKeyEnv:       "TYPESAFE_API_KEY",
+			TimeoutMS:       4000,
+			LeaseTTLSeconds: 600,
+			DecisionsPath:   "~/.local/state/conduit/decisions.jsonl",
+			// Catalog left nil so a TOML [[jev.catalog]] replaces rather than
+			// appends; Load fills DefaultCatalog when still empty.
 		},
 	}
 }
@@ -141,8 +190,13 @@ func Load(path string) (Config, error) {
 		}
 	}
 
-	applyEnv(&cfg)
+	// .env first: applyEnv reads the process environment, so env-file values
+	// (CONDUIT_JEV_TIMEOUT_MS and friends) have to be in it by then. Loading
+	// earlier is safe for the key resolution below — loadDotEnvFile never
+	// overrides a variable that is already exported, so a real env value still
+	// wins over the file.
 	loadDotEnvFile(filepath.Join(filepath.Dir(path), ".env"))
+	applyEnv(&cfg)
 
 	if cfg.GLM.ModelMap == nil {
 		cfg.GLM.ModelMap = map[string]string{}
@@ -165,6 +219,26 @@ func Load(path string) (Config, error) {
 		dsKeyEnv = "DEEPSEEK_API_KEY"
 	}
 	cfg.DeepSeekAPIKey = os.Getenv(dsKeyEnv)
+
+	// Jev key is optional: absence just disables jev mode.
+	tsKeyEnv := cfg.Jev.APIKeyEnv
+	if tsKeyEnv == "" {
+		tsKeyEnv = "TYPESAFE_API_KEY"
+	}
+	cfg.TypeSafeAPIKey = os.Getenv(tsKeyEnv)
+	if len(cfg.Jev.Catalog) == 0 {
+		cfg.Jev.Catalog = DefaultCatalog()
+	}
+	if cfg.Jev.TimeoutMS <= 0 {
+		cfg.Jev.TimeoutMS = 4000
+	}
+	if cfg.Jev.LeaseTTLSeconds <= 0 {
+		cfg.Jev.LeaseTTLSeconds = 600
+	}
+	if cfg.Jev.BaseURL == "" {
+		cfg.Jev.BaseURL = "https://api.typesafe.ai/v1/systemone"
+	}
+	cfg.Jev.DecisionsPath = ExpandHome(cfg.Jev.DecisionsPath)
 
 	cfg.LocalToken = os.Getenv("CONDUIT_LOCAL_TOKEN")
 	if cfg.LocalToken == "" {
@@ -294,6 +368,11 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("CLAUDE_GLM_GATEWAY_MAX_TRANSIENT_RETRIES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Anthropic.MaxTransientRetries = n
+		}
+	}
+	if v := os.Getenv("CONDUIT_JEV_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Jev.TimeoutMS = n
 		}
 	}
 }

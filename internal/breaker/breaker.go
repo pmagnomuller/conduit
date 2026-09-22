@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/pedro-mueller/conduit/internal/route"
 )
 
 type State string
@@ -32,12 +34,14 @@ type LastQuotaEvent struct {
 }
 
 type Snapshot struct {
-	Entries map[string]Entry `json:"entries"`
-	LastQuota *LastQuotaEvent `json:"last_quota,omitempty"`
+	Entries   map[string]Entry `json:"entries"`
+	LastQuota *LastQuotaEvent  `json:"last_quota,omitempty"`
 	// Forced routing (manual override via /_gateway/route). Empty provider
 	// means automatic breaker-driven routing.
 	ForcedProvider string `json:"forced_provider,omitempty"`
 	ForcedModel    string `json:"forced_model,omitempty"`
+	// Routing mode (auto|pinned|jev). "" on load ⇒ auto.
+	Mode string `json:"mode,omitempty"`
 }
 
 // Key identifies breaker state for an (upstream, model) pair.
@@ -51,15 +55,16 @@ func Key(upstream, model string) string {
 type Logger func(format string, args ...any)
 
 type Breaker struct {
-	mu       sync.Mutex
-	entries  map[string]Entry
-	lastQuota *LastQuotaEvent
+	mu             sync.Mutex
+	entries        map[string]Entry
+	lastQuota      *LastQuotaEvent
 	forcedProvider string
 	forcedModel    string
-	path     string
-	fallback time.Duration
-	probeOn  bool
-	log      Logger
+	mode           route.Mode
+	path           string
+	fallback       time.Duration
+	probeOn        bool
+	log            Logger
 }
 
 func New(path string, fallbackOpen time.Duration, probeOnExpiry bool, log Logger) *Breaker {
@@ -68,6 +73,7 @@ func New(path string, fallbackOpen time.Duration, probeOnExpiry bool, log Logger
 	}
 	b := &Breaker{
 		entries:  make(map[string]Entry),
+		mode:     route.ModeAuto,
 		path:     path,
 		fallback: fallbackOpen,
 		probeOn:  probeOnExpiry,
@@ -99,6 +105,15 @@ func (b *Breaker) load() error {
 	b.lastQuota = snap.LastQuota
 	b.forcedProvider = snap.ForcedProvider
 	b.forcedModel = snap.ForcedModel
+	m, ok := route.ParseMode(snap.Mode)
+	if !ok {
+		m = route.ModeAuto
+	}
+	// Legacy state files (no mode) with a forced provider are pinned.
+	if snap.Mode == "" && b.forcedProvider != "" {
+		m = route.ModePinned
+	}
+	b.mode = m
 	return nil
 }
 
@@ -109,7 +124,7 @@ func (b *Breaker) persistLocked() error {
 	if err := os.MkdirAll(filepath.Dir(b.path), 0o755); err != nil {
 		return err
 	}
-	snap := Snapshot{Entries: b.entries, LastQuota: b.lastQuota, ForcedProvider: b.forcedProvider, ForcedModel: b.forcedModel}
+	snap := Snapshot{Entries: b.entries, LastQuota: b.lastQuota, ForcedProvider: b.forcedProvider, ForcedModel: b.forcedModel, Mode: string(b.mode)}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err
@@ -146,6 +161,36 @@ func (b *Breaker) Decide(upstream, model string, now time.Time) State {
 			delete(b.entries, key)
 			_ = b.persistLocked()
 			b.log("BREAKER CLOSED %s (open window expired, probe disabled)", model)
+			return Closed
+		}
+		return Open
+	case Probe:
+		return Probe
+	default:
+		return Closed
+	}
+}
+
+// State reports the effective routing state for a model right now without
+// transitioning it, persisting, or logging. Decide is the request path and is
+// allowed to advance an expired OPEN window to PROBE (or to clear it when
+// probes are disabled); readers that merely describe state — candidate
+// filtering while another model is chosen, the UI — must not move an entry for
+// a model the current call may never touch. Keep the window logic in step with
+// Decide.
+func (b *Breaker) State(upstream, model string, now time.Time) State {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.entries[Key(upstream, model)]
+	if !ok {
+		return Closed
+	}
+	switch e.State {
+	case Open:
+		if !e.Until.IsZero() && !now.Before(e.Until) {
+			if b.probeOn {
+				return Probe
+			}
 			return Closed
 		}
 		return Open
@@ -236,7 +281,7 @@ func (b *Breaker) Snapshot() Snapshot {
 		tmp := *b.lastQuota
 		lq = &tmp
 	}
-	return Snapshot{Entries: cp, LastQuota: lq}
+	return Snapshot{Entries: cp, LastQuota: lq, ForcedProvider: b.forcedProvider, ForcedModel: b.forcedModel, Mode: string(b.mode)}
 }
 
 func (b *Breaker) Entry(upstream, model string) (Entry, bool) {
@@ -255,8 +300,34 @@ func (b *Breaker) SetForce(provider, model string) {
 	defer b.mu.Unlock()
 	b.forcedProvider = provider
 	b.forcedModel = model
+	if provider != "" {
+		b.mode = route.ModePinned
+	} else {
+		b.mode = route.ModeAuto
+	}
 	_ = b.persistLocked()
 	b.log("ROUTE FORCED %s %s", provider, model)
+}
+
+// Mode returns the current routing mode.
+func (b *Breaker) Mode() route.Mode {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.mode
+}
+
+// SetMode switches routing mode and persists it. auto|jev clear any forced
+// provider; pinned keeps the existing force (caller validates one exists).
+func (b *Breaker) SetMode(m route.Mode) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if m != route.ModePinned {
+		b.forcedProvider = ""
+		b.forcedModel = ""
+	}
+	b.mode = m
+	_ = b.persistLocked()
+	b.log("ROUTE MODE %s", m)
 }
 
 func (b *Breaker) ClearForce() { b.SetForce("", "") }

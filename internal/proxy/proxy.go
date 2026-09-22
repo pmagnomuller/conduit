@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,25 +24,49 @@ import (
 	"github.com/pedro-mueller/conduit/internal/metrics"
 	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/redact"
+	"github.com/pedro-mueller/conduit/internal/route"
 )
 
 const anthropicUpstream = "anthropic"
+
+// maxProxyBodyBytes caps the inbound proxy body before anything reads it.
+// /v1/messages bodies carry the whole conversation plus tool schemas, so the
+// cap is generous; it exists to bound the gateway's own memory — the body is
+// read once to find the model field and, in jev mode, parsed a second time for
+// the Jev dossier — rather than to police clients. A body past the cap would
+// almost certainly be rejected upstream anyway.
+const maxProxyBodyBytes = 32 << 20 // 32 MiB
+
+// Decider is the per-call router consulted in jev mode. *route.Router
+// satisfies it; nil means jev is unavailable.
+type Decider interface {
+	Enabled() bool
+	Catalog() []route.Candidate
+	Decide(ctx context.Context, body []byte, candidates []route.Candidate) (route.Decision, bool)
+	Recent(n int) []route.Decision
+}
+
+// decisionKey carries the jev decision source through the request context so
+// logRequest can report it regardless of which serve* path handled the call.
+type decisionKey struct{}
 
 type Gateway struct {
 	cfg     config.Config
 	breaker *breaker.Breaker
 	capture *capture.Writer
 	metrics *metrics.Counters
+	router  Decider
 	client  *http.Client
 	log     *slog.Logger
 
-	lastMu           sync.Mutex
-	lastProvider     string
-	lastUpstream     string
-	lastAt           time.Time
+	lastMu       sync.Mutex
+	lastProvider string
+	lastUpstream string
+	lastAt       time.Time
 }
 
-func New(cfg config.Config, br *breaker.Breaker, cap *capture.Writer, met *metrics.Counters, log *slog.Logger) *Gateway {
+// New builds the gateway. router may be nil (jev mode disabled).
+func New(cfg config.Config, br *breaker.Breaker, cap *capture.Writer, met *metrics.Counters, router Decider, log *slog.Logger) *Gateway {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -49,6 +75,7 @@ func New(cfg config.Config, br *breaker.Breaker, cap *capture.Writer, met *metri
 		breaker: br,
 		capture: cap,
 		metrics: met,
+		router:  router,
 		client: &http.Client{
 			// No global Timeout — streaming requests can run a long time.
 			Transport: &http.Transport{
@@ -63,6 +90,10 @@ func New(cfg config.Config, br *breaker.Breaker, cap *capture.Writer, met *metri
 		},
 		log: log,
 	}
+}
+
+func (g *Gateway) jevEnabled() bool {
+	return g.router != nil && g.router.Enabled()
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -85,42 +116,132 @@ func (g *Gateway) handleRoute(w http.ResponseWriter, r *http.Request) {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(map[string]any{
+			"mode":            string(g.breaker.Mode()),
 			"forced_provider": g.breaker.ForcedProvider(),
 			"forced_model":    g.breaker.ForcedModel(),
 			"available":       g.availableModels(),
+			"jev":             g.jevSnapshot(),
 			"last_request":    g.lastRequestSnapshot(),
 		})
 	case http.MethodPost:
+		if !g.routePostAllowed(w, r) {
+			return
+		}
 		var req struct {
 			Clear    bool   `json:"clear"`
 			Provider string `json:"provider"`
 			Model    string `json:"model"`
+			Mode     string `json:"mode"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&req); err != nil {
 			http.Error(w, `{"error":"bad json"}`, http.StatusBadRequest)
 			return
 		}
-		if req.Clear {
-			g.breaker.ClearForce()
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "automatic"})
-			return
-		}
-		switch req.Provider {
-		case "", "anthropic", "glm":
-		case "deepseek":
-			if g.cfg.DeepSeekAPIKey == "" {
-				http.Error(w, `{"error":"deepseek tier disabled (no DEEPSEEK_API_KEY)"}`, http.StatusBadRequest)
+		var mode route.Mode
+		if req.Mode != "" {
+			m, ok := route.ParseMode(req.Mode)
+			if !ok {
+				http.Error(w, `{"error":"mode must be auto|pinned|jev"}`, http.StatusBadRequest)
 				return
 			}
-		default:
-			http.Error(w, `{"error":"provider must be anthropic|glm|deepseek or use clear"}`, http.StatusBadRequest)
-			return
+			mode = m
 		}
-		g.breaker.SetForce(req.Provider, req.Model)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "forced", "provider": req.Provider, "model": req.Model})
+		switch {
+		case req.Clear:
+			g.breaker.ClearForce()
+		case req.Provider != "":
+			// Legacy pin shape; an explicit non-pinned mode alongside it is contradictory.
+			if mode != "" && mode != route.ModePinned {
+				http.Error(w, `{"error":"provider implies pinned mode; drop mode or use pinned"}`, http.StatusBadRequest)
+				return
+			}
+			switch req.Provider {
+			case "anthropic", "glm":
+			case "deepseek":
+				if g.cfg.DeepSeekAPIKey == "" {
+					http.Error(w, `{"error":"deepseek tier disabled (no DEEPSEEK_API_KEY)"}`, http.StatusBadRequest)
+					return
+				}
+			default:
+				http.Error(w, `{"error":"provider must be anthropic|glm|deepseek or use clear"}`, http.StatusBadRequest)
+				return
+			}
+			g.breaker.SetForce(req.Provider, req.Model)
+		case mode == route.ModeJev:
+			if !g.jevEnabled() {
+				http.Error(w, `{"error":"jev disabled (no TYPESAFE_API_KEY)"}`, http.StatusBadRequest)
+				return
+			}
+			g.breaker.SetMode(route.ModeJev)
+		case mode == route.ModePinned:
+			if g.breaker.ForcedProvider() == "" {
+				http.Error(w, `{"error":"pinned mode needs provider"}`, http.StatusBadRequest)
+				return
+			}
+			g.breaker.SetMode(route.ModePinned)
+		default:
+			// {"mode":"auto"} or legacy {"provider":""}: back to automatic.
+			g.breaker.ClearForce()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":   "ok",
+			"mode":     string(g.breaker.Mode()),
+			"provider": g.breaker.ForcedProvider(),
+			"model":    g.breaker.ForcedModel(),
+		})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// routePostAllowed vets a state-changing POST to /_gateway/route.
+//
+// The gateway listens on loopback, but that does not make it private: any page
+// the user happens to have open can reach it. A POST that is a "simple request"
+// — form-encoded or text/plain, no preflight — is enough for such a page to
+// flip the routing mode, and jev mode starts sending prompt excerpts to an
+// external service, so the flip is a data-exposure decision.
+//
+// Two checks, in this order:
+//   - an Origin naming anything other than this gateway is rejected. Browsers
+//     attach Origin to every cross-origin POST, so the form-post vector is
+//     covered here; requests with no Origin (curl, the UI's same-origin fetch)
+//     are unaffected.
+//   - the content type must be one the documented clients actually send:
+//     application/json (the UI, the README) and application/x-www-form-urlencoded
+//     (what a bare `curl -d '{...}'` sends by default). Anything else — notably
+//     text/plain, the classic way to sneak a body past a preflight-free
+//     request — is refused. The body is parsed as JSON either way.
+func (g *Gateway) routePostAllowed(w http.ResponseWriter, r *http.Request) bool {
+	if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(r, origin) {
+		http.Error(w, `{"error":"cross-origin request rejected"}`, http.StatusForbidden)
+		return false
+	}
+	ct := r.Header.Get("Content-Type")
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		ct = mt
+	}
+	switch ct {
+	case "application/json", "application/x-www-form-urlencoded":
+		return true
+	}
+	http.Error(w, `{"error":"Content-Type must be application/json"}`, http.StatusUnsupportedMediaType)
+	return false
+}
+
+// sameOrigin reports whether an Origin header value names this gateway. The
+// Host the client used is the only origin worth trusting: the listener is
+// loopback-only and a rebound/foreign origin will not match it.
+func sameOrigin(r *http.Request, origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return strings.EqualFold(u.Scheme, scheme) && strings.EqualFold(u.Host, r.Host)
 }
 
 // availableModels lists selectable upstream models per provider for the UI.
@@ -130,6 +251,26 @@ func (g *Gateway) availableModels() map[string][]string {
 		"glm":       {"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-4.5-air"},
 		"deepseek":  {"deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"},
 	}
+}
+
+// jevSnapshot describes the Jev router for the UI: enabled flag, catalog and
+// recent decisions (newest first, ≤50).
+func (g *Gateway) jevSnapshot() map[string]any {
+	out := map[string]any{
+		"enabled": g.jevEnabled(),
+		"catalog": []route.Candidate{},
+		"recent":  []route.Decision{},
+	}
+	if g.router == nil {
+		return out
+	}
+	if c := g.router.Catalog(); c != nil {
+		out["catalog"] = c
+	}
+	if rc := g.router.Recent(50); rc != nil {
+		out["recent"] = rc
+	}
+	return out
 }
 
 func (g *Gateway) lastRequestSnapshot() map[string]string {
@@ -166,6 +307,8 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		ForcedProvider: g.breaker.ForcedProvider(),
 		ForcedModel:    g.breaker.ForcedModel(),
+		Mode:           string(g.breaker.Mode()),
+		JevEnabled:     g.jevEnabled(),
 		LastRequest:    g.lastRequestSnapshot(),
 	}
 	if g.cfg.DeepSeekAPIKey != "" {
@@ -174,13 +317,21 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(resp)
+	_ = enc.Encode(&resp)
 }
 
 func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	r.Body = http.MaxBytesReader(w, r.Body, maxProxyBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// 413 with a readable body: the client sees a clean rejection
+			// rather than a silently truncated prompt.
+			http.Error(w, fmt.Sprintf(`{"type":"error","error":{"type":"gateway_error","message":"request body exceeds the %d MiB gateway limit"}}`, maxProxyBodyBytes>>20), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return
 	}
@@ -190,16 +341,16 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	switch g.breaker.ForcedProvider() {
 	case "glm":
-		g.serveGLM(w, r, body, model, start, false)
+		g.serveGLM(w, r, body, model, start, false, "")
 		return
 	case "deepseek":
-		if !g.tryDeepSeek(w, r, body, model, start, false, "forced") {
+		if !g.tryDeepSeek(w, r, body, model, start, false, "forced", "") {
 			http.Error(w, `{"type":"error","error":{"type":"gateway_error","message":"route forced to deepseek but DEEPSEEK_API_KEY is unset"}}`, http.StatusBadGateway)
 			g.logRequest(r, model, model, "deepseek", 502, start, false)
 		}
 		return
 	case "anthropic":
-		g.serveAnthropic(w, r, body, model, start, false)
+		g.serveAnthropic(w, r, body, model, start, false, "")
 		return
 	}
 
@@ -209,36 +360,144 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if g.usesLocalToken(r) {
 		switch g.cfg.LocalTokenProvider {
 		case "deepseek":
-			if g.tryDeepSeek(w, r, body, model, start, false, "local_token") {
+			if g.tryDeepSeek(w, r, body, model, start, false, "local_token", "") {
 				return
 			}
 		case "anthropic":
-			g.serveAnthropic(w, r, body, model, start, false)
+			g.serveAnthropic(w, r, body, model, start, false, "")
 			return
 		default:
-			g.serveGLM(w, r, body, model, start, false)
+			g.serveGLM(w, r, body, model, start, false, "")
 			return
 		}
 	}
 
 	state := g.breaker.Decide(anthropicUpstream, model, time.Now())
 
+	// jev mode: ask the router to pick provider+model from the catalog. The
+	// breaker still wins (Anthropic dropped while OPEN); any router failure
+	// falls open to the auto path below for this call.
+	//
+	// Only real model calls qualify: a body with no model field (a favicon or
+	// other GET the client fires at the gateway) has nothing to choose between,
+	// and consulting Jev for it would spend a round-trip and log a decision
+	// with an empty requested_model.
+	//
+	// A due PROBE is the other exception: the half-open probe asks whether the
+	// requested model recovered, and jev mode may keep picking other providers,
+	// so honouring the pick would leave the entry stuck in PROBE (status and UI
+	// reporting probe forever). Hand the probe to Anthropic with the requested
+	// model and no decision header, exactly as auto mode would.
+	if g.breaker.Mode() == route.ModeJev && state != breaker.Probe && g.jevEnabled() && model != "" && r.Method == http.MethodPost {
+		// Candidate filtering is read-only: it must not transition, persist or
+		// log breaker state for models this call may never reach.
+		cands := g.jevCandidates(model, g.breaker.State(anthropicUpstream, model, time.Now()))
+		d, ok := g.router.Decide(r.Context(), body, cands)
+		g.metrics.IncJevDecision()
+		if ok {
+			r = r.WithContext(context.WithValue(r.Context(), decisionKey{}, d.Source))
+			w.Header().Set("X-Conduit-Decision", d.Source)
+			// The model that will actually be sent upstream. Every breaker- or
+			// notice-related bookkeeping keys on it rather than on the inbound
+			// id: a quota 429 from the picked model must not open the entry for
+			// a different, healthy one, and a 2xx must not close someone
+			// else's probe.
+			served := d.Model
+			if served == "" {
+				served = model
+			}
+			switch d.Provider {
+			case "anthropic":
+				g.serveAnthropic(w, r, body, model, start, g.probeDue(served), served)
+				return
+			case "glm":
+				g.serveGLM(w, r, body, model, start, false, d.Model)
+				return
+			case "deepseek":
+				// Not reachable in practice: jevCandidates drops deepseek unless
+				// a key is configured, and the router answers only with offered
+				// catalog keys. Falling out of the switch rather than returning
+				// keeps the fail-open guarantee if it ever happens anyway, with
+				// serveDeepSeek's key check as the backstop.
+				if g.tryDeepSeek(w, r, body, model, start, false, "jev", d.Model) {
+					return
+				}
+			default:
+				g.log.Warn("jev returned unknown provider; falling back to auto", "provider", d.Provider)
+			}
+		}
+		g.metrics.IncJevFailOpen()
+		r = r.WithContext(context.WithValue(r.Context(), decisionKey{}, "fail_open"))
+		w.Header().Set("X-Conduit-Decision", "fail_open")
+	}
+
 	switch state {
 	case breaker.Open:
-		g.serveGLM(w, r, body, model, start, false)
+		g.serveGLM(w, r, body, model, start, false, "")
 		return
 	case breaker.Probe:
-		g.serveAnthropic(w, r, body, model, start, true)
+		g.serveAnthropic(w, r, body, model, start, true, "")
 		return
 	default:
-		g.serveAnthropic(w, r, body, model, start, false)
+		g.serveAnthropic(w, r, body, model, start, false, "")
 	}
 }
 
-func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, isProbe bool) {
+// jevCandidates filters the catalog for this call: Anthropic entries are
+// dropped while the breaker is OPEN (for the requested model, or for the
+// candidate's own model), DeepSeek entries when no key is configured.
+//
+// requested is the caller's breaker reading for the inbound model, taken
+// read-only (breaker.State): a Jev request may call none of these models, so
+// filtering must not transition, persist or log breaker state for any of them.
+func (g *Gateway) jevCandidates(model string, requested breaker.State) []route.Candidate {
+	full := g.router.Catalog()
+	out := make([]route.Candidate, 0, len(full))
+	now := time.Now()
+	for _, c := range full {
+		switch c.Provider {
+		case "anthropic":
+			if requested == breaker.Open {
+				continue
+			}
+			if c.Model != model && g.breaker.State(anthropicUpstream, c.Model, now) == breaker.Open {
+				continue
+			}
+		case "deepseek":
+			if g.cfg.DeepSeekAPIKey == "" {
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// probeDue advances an expired OPEN window for model to PROBE and reports
+// whether the next call to that model is the half-open probe. Like Decide, the
+// request path may transition state; the probe a successful call resolves must
+// be the entry of the model actually sent upstream.
+func (g *Gateway) probeDue(model string) bool {
+	return g.breaker.Decide(anthropicUpstream, model, time.Now()) == breaker.Probe
+}
+
+// serveAnthropic forwards to Anthropic. modelOverride (jev mode) replaces the
+// inbound model when it differs; "" keeps the body byte-identical. All breaker
+// and notify bookkeeping keys on the model actually sent upstream (model when
+// no override applies), never on the inbound id.
+func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, isProbe bool, modelOverride string) {
 	var lastResp *http.Response
 	var lastBody []byte
 	var lastErr error
+
+	upstreamModel := model
+	upstreamBody := body
+	if modelOverride != "" && modelOverride != model {
+		if rewritten, err := rewriteModel(body, modelOverride); err == nil {
+			upstreamBody = rewritten
+			upstreamModel = modelOverride
+		}
+	}
 
 	attempts := 1 + g.cfg.Anthropic.MaxTransientRetries
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -246,11 +505,11 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			g.metrics.IncTransientRetry()
 			backoff := jitteredBackoff(attempt)
 			g.log.Info("retrying anthropic after transient error",
-				"attempt", attempt, "backoff", backoff.String(), "model", model)
+				"attempt", attempt, "backoff", backoff.String(), "model", upstreamModel)
 			time.Sleep(backoff)
 		}
 
-		resp, respBody, peeked, err := g.roundTrip("anthropic", g.cfg.Anthropic.BaseURL, r, body, "", model)
+		resp, respBody, peeked, err := g.roundTrip("anthropic", g.cfg.Anthropic.BaseURL, r, upstreamBody, "", upstreamModel)
 		if err != nil {
 			lastErr = err
 			continue
@@ -265,28 +524,36 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 				g.cfg.Breaker.ProactiveThreshold,
 				g.cfg.Breaker.ProactiveUtilization,
 			); ok {
-				if g.breaker.Open(anthropicUpstream, model, "proactive_"+reason, until, time.Now()) {
-					notify.FailoverToGLM(model, g.glmModelFor(model), "proactive_"+reason)
+				if g.breaker.Open(anthropicUpstream, upstreamModel, "proactive_"+reason, until, time.Now()) {
+					notify.FailoverToGLM(upstreamModel, g.glmModelFor(upstreamModel), "proactive_"+reason)
 				}
 			}
 			if isProbe {
-				if g.breaker.Close(anthropicUpstream, model, time.Now()) {
-					notify.BackToAnthropic(model)
+				if g.breaker.Close(anthropicUpstream, upstreamModel, time.Now()) {
+					notify.BackToAnthropic(upstreamModel)
 				}
 			}
 			g.metrics.IncAnthropic()
 			g.writeUpstream(w, resp, respBody, "anthropic", false, "")
-			g.logRequest(r, model, model, "anthropic", resp.StatusCode, start, false)
+			g.logRequest(r, model, upstreamModel, "anthropic", resp.StatusCode, start, false)
 			return
 		}
 
 		class := classify.ClassifyAnthropic(resp.StatusCode, resp.Header, respBody)
-		_ = g.capture.Write(capture.FromResponse("anthropic", r.Method, r.URL.Path, model, resp.StatusCode, resp.Header, respBody, class.Reason))
+		_ = g.capture.Write(capture.FromResponse("anthropic", r.Method, r.URL.Path, upstreamModel, resp.StatusCode, resp.Header, respBody, class.Reason))
 
 		switch class.Kind {
 		case classify.Quota:
-			if g.breaker.Open(anthropicUpstream, model, class.Reason, class.Until, time.Now()) {
-				notify.FailoverToGLM(model, g.glmModelFor(model), class.Reason)
+			// The GLM tier and the notice are resolved from the model actually
+			// sent upstream, so the notice names the pair that will really
+			// serve this call. An override equal to "" keeps serveGLM's own
+			// mapping, which is what auto mode has always done.
+			failoverOverride := ""
+			if upstreamModel != model {
+				failoverOverride = g.glmModelFor(upstreamModel)
+			}
+			if g.breaker.Open(anthropicUpstream, upstreamModel, class.Reason, class.Until, time.Now()) {
+				notify.FailoverToGLM(upstreamModel, g.glmModelFor(upstreamModel), class.Reason)
 			}
 			_ = resp.Body.Close()
 			// Pre-stream (or non-stream) failover: client has not seen bytes yet
@@ -295,14 +562,14 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			// quota errors rather than fail over.
 			if !peeked && g.breaker.ForcedProvider() != "anthropic" {
 				g.metrics.IncFailover()
-				g.serveGLM(w, r, body, model, start, true)
+				g.serveGLM(w, r, body, model, start, true, failoverOverride)
 				return
 			}
 			// Mid-stream: already copied error? Shouldn't happen — we only peek
 			// non-2xx before writing. If peeked somehow, surface.
 			g.metrics.IncAnthropic()
 			g.writeUpstream(w, resp, respBody, "anthropic", false, "")
-			g.logRequest(r, model, model, "anthropic", resp.StatusCode, start, false)
+			g.logRequest(r, model, upstreamModel, "anthropic", resp.StatusCode, start, false)
 			return
 
 		case classify.Transient:
@@ -317,7 +584,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			}
 			g.metrics.IncAnthropic()
 			g.writeUpstream(w, resp, respBody, "anthropic", false, "")
-			g.logRequest(r, model, model, "anthropic", resp.StatusCode, start, false)
+			g.logRequest(r, model, upstreamModel, "anthropic", resp.StatusCode, start, false)
 			return
 		}
 	}
@@ -325,7 +592,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 	if lastResp != nil {
 		g.metrics.IncAnthropic()
 		g.writeUpstream(w, lastResp, lastBody, "anthropic", false, "")
-		g.logRequest(r, model, model, "anthropic", lastResp.StatusCode, start, false)
+		g.logRequest(r, model, upstreamModel, "anthropic", lastResp.StatusCode, start, false)
 		return
 	}
 	msg := "upstream anthropic unreachable"
@@ -333,15 +600,21 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 		msg = redact.String(lastErr.Error())
 	}
 	http.Error(w, msg, http.StatusBadGateway)
-	g.logRequest(r, model, model, "anthropic", 502, start, false)
+	g.logRequest(r, model, upstreamModel, "anthropic", 502, start, false)
 }
 
-func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool) {
-	glmModel, ok := g.cfg.MapModel(model)
-	if !ok {
-		http.Error(w, fmt.Sprintf(`{"type":"error","error":{"type":"gateway_error","message":"no GLM model mapping for %q and default_model unset"}}`, model), http.StatusBadGateway)
-		g.logRequest(r, model, model, "glm", 502, start, failover)
-		return
+// serveGLM forwards to Z.ai. modelOverride (jev mode) bypasses the model map;
+// "" uses the configured mapping (and ForcedModel when pinned to glm).
+func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, modelOverride string) {
+	glmModel := modelOverride
+	if glmModel == "" {
+		var ok bool
+		glmModel, ok = g.cfg.MapModel(model)
+		if !ok {
+			http.Error(w, fmt.Sprintf(`{"type":"error","error":{"type":"gateway_error","message":"no GLM model mapping for %q and default_model unset"}}`, model), http.StatusBadGateway)
+			g.logRequest(r, model, model, "glm", 502, start, failover)
+			return
+		}
 	}
 	if g.breaker.ForcedProvider() == "glm" {
 		if m := g.breaker.ForcedModel(); m != "" {
@@ -356,7 +629,7 @@ func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, 
 
 	resp, respBody, _, err := g.roundTrip("glm", g.cfg.GLM.BaseURL, r, rewritten, g.cfg.ZAIAPIKey, glmModel)
 	if err != nil {
-		if g.tryDeepSeek(w, r, body, model, start, failover, "glm_unreachable") {
+		if g.tryDeepSeek(w, r, body, model, start, failover, "glm_unreachable", "") {
 			return
 		}
 		http.Error(w, redact.String(err.Error()), http.StatusBadGateway)
@@ -366,7 +639,7 @@ func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, 
 	if resp.StatusCode >= 400 {
 		_ = g.capture.Write(capture.FromResponse("glm", r.Method, r.URL.Path, glmModel, resp.StatusCode, resp.Header, respBody, "glm_error"))
 	}
-	if shouldFallToDeepSeek(resp.StatusCode) && g.tryDeepSeek(w, r, body, model, start, failover, fmt.Sprintf("glm_%d", resp.StatusCode)) {
+	if shouldFallToDeepSeek(resp.StatusCode) && g.tryDeepSeek(w, r, body, model, start, failover, fmt.Sprintf("glm_%d", resp.StatusCode), "") {
 		_ = resp.Body.Close()
 		return
 	}
@@ -416,31 +689,37 @@ func shouldFallToDeepSeek(status int) bool {
 // tryDeepSeek serves the request from the DeepSeek tier when configured.
 // Returns false (untouched) when the tier is disabled; the caller must then
 // surface its own error.
-func (g *Gateway) tryDeepSeek(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, reason string) bool {
+func (g *Gateway) tryDeepSeek(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, reason string, modelOverride string) bool {
 	if g.cfg.DeepSeekAPIKey == "" {
 		return false
 	}
-	g.serveDeepSeek(w, r, body, model, start, failover, reason)
+	g.serveDeepSeek(w, r, body, model, start, failover, reason, modelOverride)
 	return true
 }
 
-func (g *Gateway) serveDeepSeek(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, reason string) {
-	dsModel, ok := g.cfg.MapModelDeepSeek(model)
-	if !ok {
-		http.Error(w, fmt.Sprintf(`{"type":"error","error":{"type":"gateway_error","message":"no DeepSeek model mapping for %q and default_model unset"}}`, model), http.StatusBadGateway)
-		g.logRequest(r, model, model, "deepseek", 502, start, failover)
-		return
+// serveDeepSeek forwards to DeepSeek. modelOverride (jev mode) bypasses the
+// model map; "" uses the configured mapping (and ForcedModel when pinned).
+func (g *Gateway) serveDeepSeek(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, reason string, modelOverride string) {
+	dsModel := modelOverride
+	if dsModel == "" {
+		var ok bool
+		dsModel, ok = g.cfg.MapModelDeepSeek(model)
+		if !ok {
+			http.Error(w, fmt.Sprintf(`{"type":"error","error":{"type":"gateway_error","message":"no DeepSeek model mapping for %q and default_model unset"}}`, model), http.StatusBadGateway)
+			g.logRequest(r, model, model, "deepseek", 502, start, failover)
+			return
+		}
 	}
 	if g.breaker.ForcedProvider() == "deepseek" {
 		if m := g.breaker.ForcedModel(); m != "" {
 			dsModel = m
 		}
 	}
-	notify.FailoverToDeepSeek(model, dsModel, reason)
-	rewritten, err := rewriteModel(body, dsModel)
-	if err != nil {
-		rewritten = body
+	// A deliberate jev pick is not a failover: skip the route file / toast.
+	if reason != "jev" {
+		notify.FailoverToDeepSeek(model, dsModel, reason)
 	}
+	rewritten := prepareDeepSeekBody(body, dsModel)
 
 	resp, respBody, _, err := g.roundTrip("deepseek", g.cfg.DeepSeek.BaseURL, r, rewritten, g.cfg.DeepSeekAPIKey, dsModel)
 	if err != nil {
@@ -610,7 +889,7 @@ func (g *Gateway) logRequest(r *http.Request, model, upstreamModel, provider str
 	g.lastUpstream = upstreamModel
 	g.lastAt = time.Now()
 	g.lastMu.Unlock()
-	g.log.Info("request",
+	attrs := []any{
 		"method", r.Method,
 		"path", r.URL.Path,
 		"model", model,
@@ -619,7 +898,12 @@ func (g *Gateway) logRequest(r *http.Request, model, upstreamModel, provider str
 		"status", status,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"failover", failover,
-	)
+		"mode", string(g.breaker.Mode()),
+	}
+	if src, ok := r.Context().Value(decisionKey{}).(string); ok && src != "" {
+		attrs = append(attrs, "decision_source", src)
+	}
+	g.log.Info("request", attrs...)
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -650,9 +934,11 @@ func extractModel(body []byte) string {
 }
 
 // rewriteModel changes only the "model" JSON string value, preserving the rest
-// of the body bytes as far as encoding/json allows. For prompt-cache safety on
-// the Anthropic path we never call this; on the GLM path byte-identity of the
-// Anthropic body is not required.
+// of the body bytes as far as encoding/json allows. In auto/pinned mode the
+// Anthropic path forwards the body byte-identical (no call); in jev mode it is
+// applied on the Anthropic path too when Jev picks a different Claude model —
+// Anthropic's prompt cache is keyed per model, so re-encoding costs nothing
+// that the model switch has not already cost.
 func rewriteModel(body []byte, newModel string) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
@@ -667,6 +953,79 @@ func rewriteModel(body []byte, newModel string) ([]byte, error) {
 	}
 	obj["model"] = b
 	return json.Marshal(obj)
+}
+
+// prepareDeepSeekBody rewrites the model and drops the "Artifact" tool, whose
+// input_schema DeepSeek's Anthropic-compatible validator rejects (400) while
+// Anthropic and GLM accept it. Artifact is a client-side render helper the
+// failover tier never needs.
+//
+// Dropping Artifact is a deliberate deviation from pure model rewriting, and it
+// applies on every path into this tier (auto failover, pinned deepseek, and a
+// jev pick) — not just jev. The alternative is a 400 that fails the whole tier.
+// No other tool is touched.
+func prepareDeepSeekBody(body []byte, model string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if b, err := json.Marshal(model); err == nil {
+		obj["model"] = b
+	}
+	if rawTools, ok := obj["tools"]; ok {
+		// A tools list that only held Artifact is dropped whole: "tools": []
+		// is not what the client asked for and some validators reject it.
+		if trimmed := dropArtifactTool(rawTools); trimmed == nil {
+			delete(obj, "tools")
+		} else {
+			obj["tools"] = trimmed
+		}
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// dropArtifactTool returns raw without the Artifact tool, or raw unchanged when
+// it held none. It returns nil when nothing is left, which the caller reads as
+// "omit the key".
+func dropArtifactTool(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var tools []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return raw
+	}
+	kept := make([]map[string]json.RawMessage, 0, len(tools))
+	changed := false
+	for _, t := range tools {
+		var name string
+		if n, ok := t["name"]; ok {
+			_ = json.Unmarshal(n, &name)
+		}
+		if name == "Artifact" {
+			changed = true
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if !changed {
+		return raw
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 func jitteredBackoff(attempt int) time.Duration {

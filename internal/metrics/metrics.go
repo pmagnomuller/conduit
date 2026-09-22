@@ -10,11 +10,13 @@ import (
 type Counters struct {
 	mu sync.Mutex
 
-	AnthropicRequests int64 `json:"anthropic_requests"`
-	GLMRequests       int64 `json:"glm_requests"`
-	DeepSeekRequests  int64 `json:"deepseek_requests"`
-	Failovers         int64 `json:"failovers"`
-	TransientRetries  int64 `json:"transient_retries"`
+	AnthropicRequests int64     `json:"anthropic_requests"`
+	GLMRequests       int64     `json:"glm_requests"`
+	DeepSeekRequests  int64     `json:"deepseek_requests"`
+	Failovers         int64     `json:"failovers"`
+	TransientRetries  int64     `json:"transient_retries"`
+	JevDecisions      int64     `json:"jev_decisions"`
+	JevFailOpen       int64     `json:"jev_fail_open"`
 	StartedAt         time.Time `json:"started_at"`
 }
 
@@ -52,6 +54,18 @@ func (c *Counters) IncTransientRetry() {
 	c.mu.Unlock()
 }
 
+func (c *Counters) IncJevDecision() {
+	c.mu.Lock()
+	c.JevDecisions++
+	c.mu.Unlock()
+}
+
+func (c *Counters) IncJevFailOpen() {
+	c.mu.Lock()
+	c.JevFailOpen++
+	c.mu.Unlock()
+}
+
 func (c *Counters) Snapshot() Counters {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -61,6 +75,8 @@ func (c *Counters) Snapshot() Counters {
 		DeepSeekRequests:  c.DeepSeekRequests,
 		Failovers:         c.Failovers,
 		TransientRetries:  c.TransientRetries,
+		JevDecisions:      c.JevDecisions,
+		JevFailOpen:       c.JevFailOpen,
 		StartedAt:         c.StartedAt,
 	}
 }
@@ -77,4 +93,7 @@ type StatusResponse struct {
 	// Forced routing state set via /_gateway/route ("" = automatic).
 	ForcedProvider string `json:"forced_provider,omitempty"`
 	ForcedModel    string `json:"forced_model,omitempty"`
+	// Routing mode (auto|pinned|jev) and whether the Jev router is usable.
+	Mode       string `json:"mode"`
+	JevEnabled bool   `json:"jev_enabled"`
 }

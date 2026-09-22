@@ -56,3 +56,29 @@ state_path = ""
 # - macOS/Linux desktop toast (disable with CONDUIT_DESKTOP_NOTIFY=0)
 # - one-shot chat notice inside Claude Code on the failover reply
 #   (disable with CONDUIT_CHAT_NOTICE=0; disable both with CONDUIT_NOTIFY=0)
+
+# Jev routing mode: per-call provider/model choice via TypeSafe System One.
+# Inert unless TYPESAFE_API_KEY is set in .env. Select the mode from the UI
+# or POST /_gateway/route {"mode":"jev"}.
+[jev]
+base_url = "https://api.typesafe.ai/v1/systemone"
+api_key_env = "TYPESAFE_API_KEY"
+# Jev answer deadline; on timeout the call falls open to auto routing.
+timeout_ms = 4000
+# How long a decision may be reused within one conversation (lease).
+lease_ttl_seconds = 600
+# Append-only log of every routing decision. Empty string disables.
+decisions_path = "~/.local/state/conduit/decisions.jsonl"
+
+# Candidate catalog. Omit to use the built-in default (opus/sonnet/haiku,
+# glm-5.3, glm-5.3-flash, deepseek-v4-flash). Defining any entry replaces
+# the whole default list. `profile` is the prior Jev reads when choosing.
+# [[jev.catalog]]
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+# profile = "Complex implementation, cross-file refactors, robust tests. Expensive."
+#
+# [[jev.catalog]]
+# provider = "glm"
+# model = "glm-5.3-flash"
+# profile = "Mechanical follow-through and simple tool continuations. Cheapest."

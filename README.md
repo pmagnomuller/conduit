@@ -42,6 +42,87 @@ Forced routing persists in `state.json` across restarts. Pinning `anthropic`
 suppresses failover (quota errors surface raw); pinning `glm`/`deepseek` pins
 every request to that provider with the model you choose.
 
+## Routing modes
+
+| mode | behaviour |
+|---|---|
+| `auto` (default) | Anthropic; breaker OPEN → GLM → DeepSeek. Today's behaviour. |
+| `pinned` | Every request to the provider/model you pinned (`forced_provider`/`forced_model`). Breaker ignored. |
+| `jev` | Per call, ask **Jev** (TypeSafe System One) to pick provider+model from a small catalog. Breaker still wins. Off unless `TYPESAFE_API_KEY` is set. |
+
+Switch in the UI (mode selector) or from Claude Code:
+
+```bash
+!curl -s -X POST localhost:8787/_gateway/route -d '{"mode":"jev"}'
+!curl -s -X POST localhost:8787/_gateway/route -d '{"mode":"auto"}'
+!curl -s -X POST localhost:8787/_gateway/route -d '{"provider":"glm","model":"glm-5.3"}'   # → pinned
+!curl -s -X POST localhost:8787/_gateway/route -d '{"clear":true}'                         # → auto
+curl -s localhost:8787/_gateway/route | jq '.mode, .jev.recent[:3]'
+```
+
+`POST /_gateway/route` accepts `Content-Type: application/json` or
+`application/x-www-form-urlencoded` (what plain `curl -d` sends) and refuses a
+request carrying a foreign `Origin`, so a web page you happen to have open
+cannot flip your routing. Other content types get 415, foreign origins 403.
+
+`{"mode":"jev"}` returns 400 when no `TYPESAFE_API_KEY` is configured;
+`{"mode":"pinned"}` returns 400 unless a provider was pinned before. The mode
+persists in `state.json` across restarts.
+
+**What Jev sees.** A bounded dossier built from the inbound `/v1/messages`
+body, never the conversation: text of the last user message (clipped
+~1200 chars head+tail), the step type (`user_turn` / `tool_step` / `other`),
+tool names plus up to three short result excerpts (errors first), the tail of
+the last assistant text on tool steps, the requested model, the thinking
+budget, message count, whether images are present, tool count. The system
+prompt and tool schemas are **not** sent. Your TypeSafe key never leaves the
+machine except to `api.typesafe.ai`; Anthropic/Z.ai/DeepSeek keys are never
+sent to Jev.
+
+**Fail-open.** Jev timeout, error, or an answer outside the catalog → that one
+call is routed exactly as `auto` would (`source: fail_open`). Jev never blocks
+a request.
+
+**Breaker precedence.** While the Anthropic breaker is OPEN (plan quota), the
+`anthropic/*` catalog entries are removed from the candidates Jev sees, so it
+can only choose GLM/DeepSeek. DeepSeek entries are removed when
+`DEEPSEEK_API_KEY` is unset.
+
+**Leases.** Jev also answers how long its pick should stick (`one_call`,
+`tool_chain`, `user_turn`); follow-up tool steps in the same conversation
+reuse the decision (`source: lease`) instead of asking again.
+
+**Half-open probes bypass Jev.** When an Anthropic entry's open window has
+expired, that one call goes to Anthropic with the model you asked for (so the
+breaker can decide whether to close) rather than to Jev's pick — the same probe
+auto mode performs. Those calls carry no `X-Conduit-Decision`.
+
+**Request size cap.** `/v1/messages` bodies are capped at 32 MiB; a larger body
+is refused with 413 before anything is sent upstream. Only the *decision*
+routing pays for parsing your body twice, so the cap applies in every mode.
+
+Every decision (including fail-open) is appended to
+`~/.local/state/conduit/decisions.jsonl` and exposed as `jev.recent` on
+`GET /_gateway/route`; proxied responses carry `X-Conduit-Decision: jev|lease|fail_open`.
+
+The log rotates at 4 MiB (one previous file, `decisions.jsonl.1`) and only ever
+records clipped fields: the prompt excerpt, tool names and the requested model
+are truncated before they reach the ring buffer, the API or the file, so a
+one-off giant `model` string cannot blow up the UI's 2 s poll.
+
+```json
+{"at":"2026-09-22T10:14:03.512Z","requested_model":"claude-sonnet-5","provider":"glm","model":"glm-5.3-flash","step":"tool_step","lease":"tool_chain","source":"jev","confidence":0.81,"latency_ms":412}
+```
+
+**Honesty caveat.** Jev decides from short capability/cost *priors* in the
+catalog (`[[jev.catalog]]` profiles), not from measured output quality — it
+has never seen the models' answers. Each non-leased call adds roughly one
+round-trip of latency (~200–800 ms typical, 4 s cap, then fail-open). If that
+trade is wrong for you, stay in `auto`.
+
+The idea and the System One question format come from
+[jev-codex-router](https://github.com/0xNatoshi/jev-codex-router).
+
 ## Clients
 
 **Claude Code** (default) — `./setup.sh` points it at the gateway
@@ -60,24 +141,30 @@ removes the entry again.
 
 ```mermaid
 flowchart TD
-    CC["Claude Code<br/>ANTHROPIC_BASE_URL=127.0.0.1:8787"] --> GW["conduit<br/>(loopback only)"]
+    CC["Claude Code / OpenCode<br/>ANTHROPIC_BASE_URL=127.0.0.1:8787"] --> GW["conduit<br/>(loopback only)"]
 
-    GW --> F{route forced?}
-    F -- "glm / deepseek" --> PIN["pinned provider + model<br/>(breaker ignored)"]
-    F -- anthropic --> AN
-    F -- "auto" --> B{breaker state}
+    GW --> M{mode}
+    M -- pinned --> PIN["pinned provider + model<br/>(breaker ignored)"]
+    M -- jev --> J["Jev picks provider+model<br/>from catalog"]
+    M -- auto --> B{breaker state}
+
+    J -- "anthropic/*<br/>(dropped while OPEN)" --> AN
+    J -- "glm/*" --> GLM
+    J -- "deepseek/*" --> DS
+    J -. "timeout / error<br/>fail-open" .-> B
 
     B -- "CLOSED / PROBE" --> AN["api.anthropic.com"]
     B -- "OPEN (plan quota)" --> GLM["api.z.ai/api/anthropic"]
     GLM -- "unreachable / 401 / 429 / 5xx" --> DS["api.deepseek.com/anthropic<br/>(needs DEEPSEEK_API_KEY)"]
 
-    AN -. "2xx" .-> OK["reply to Claude Code"]
+    AN -. "2xx" .-> OK["reply to client"]
     GLM -. "2xx" .-> OK
     DS -. "2xx" .-> OK
 
     style AN stroke:#f783ac
     style GLM stroke:#74c0fc
     style DS stroke:#63e6be
+    style J stroke:#ffd43b
 ```
 
 Failover sequence for a single request:
@@ -116,12 +203,13 @@ You need [Go 1.26+](https://go.dev/dl/) and Claude Code.
 ./setup.sh
 ```
 
-It builds the binary, asks for `ZAI_API_KEY` if missing, points Claude Code at
+It builds the binary, asks for `ZAI_API_KEY` if missing, optionally asks for a
+`TYPESAFE_API_KEY` (Jev routing mode — Enter to skip), points Claude Code at
 the gateway, and keeps conduit running (starts at login on macOS, restarts if
 it dies). Then **restart Claude Code**.
 
 ```bash
-./status.sh        # health + breaker
+./status.sh        # health + breaker + routing mode
 ./stop.sh          # pause
 ./start.sh         # resume
 ./uninstall.sh     # stop service and un-point Claude Code
@@ -184,6 +272,9 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 |---|---|---|
 | `ZAI_API_KEY` | **yes** (gateway) | Z.ai API key used when routing to GLM. Stored in `~/.config/conduit/.env` |
 | `DEEPSEEK_API_KEY` | no | Enables the terminal DeepSeek tier when set. Stored in `~/.config/conduit/.env` |
+| `TYPESAFE_API_KEY` | no | Enables Jev routing mode when set (`./setup.sh` asks once; Enter to skip). Stored in `~/.config/conduit/.env` |
+| `CONDUIT_JEV_TIMEOUT_MS` | no | Jev round-trip cap before fail-open (default `4000`) |
+| `CONDUIT_SKIP_JEV_PROMPT` | no | Set to `1` to make `./setup.sh` skip the TypeSafe key prompt |
 | `ANTHROPIC_BASE_URL` | for Claude Code | Set to `http://127.0.0.1:8787` by `./setup.sh` |
 | `CLAUDE_GLM_GATEWAY_CONFIG` | no | Alternate config path |
 | `CLAUDE_GLM_GATEWAY_LISTEN` | no | Override `listen` |
@@ -198,6 +289,13 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 | `CONDUIT_WIRE_OPENCODE` | no | Set to `1` to have `./setup.sh` wire OpenCode to the gateway |
 
 ## Model mapping
+
+On the DeepSeek tier only, a tool named `Artifact` is dropped from the request
+before forwarding (its `input_schema` is rejected by DeepSeek's
+Anthropic-compatible validator, which would fail the tier outright while
+Anthropic and GLM accept it). If that was the only declared tool, the request
+goes out without a `tools` key at all. This applies in every routing mode and
+is the one place conduit does not forward your tool list untouched.
 
 Claude Code sends Anthropic model IDs. On the GLM/DeepSeek paths the gateway
 rewrites only the JSON `model` field using `[glm.model_map]` /
@@ -220,4 +318,6 @@ make test
 ## Non-goals
 
 No cost dashboards, no mid-stream provider splicing, no response caching, no
-non-loopback bind, no gateway auth beyond localhost.
+non-loopback bind, no gateway auth beyond localhost, no LLM-based routing
+without explicit opt-in (`jev` mode is off by default and needs a key you
+provide).

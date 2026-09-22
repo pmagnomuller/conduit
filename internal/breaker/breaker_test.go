@@ -1,12 +1,16 @@
 package breaker_test
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/pedro-mueller/conduit/internal/breaker"
+	"github.com/pedro-mueller/conduit/internal/route"
 )
 
 func TestTransitions(t *testing.T) {
@@ -95,5 +99,178 @@ func TestFallbackUntilWhenZero(t *testing.T) {
 	delta := e.Until.Sub(now)
 	if delta < 80*time.Second || delta > 100*time.Second {
 		t.Fatalf("fallback until delta=%s", delta)
+	}
+}
+
+func TestRoutingModeInvariantsAndPersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	var logs []string
+	br := breaker.New(path, time.Minute, true, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	if br.Mode() != route.ModeAuto {
+		t.Fatalf("default mode=%s", br.Mode())
+	}
+
+	br.SetForce("glm", "glm-5.3")
+	if br.Mode() != route.ModePinned {
+		t.Fatalf("SetForce mode=%s", br.Mode())
+	}
+	br.ClearForce()
+	if br.Mode() != route.ModeAuto || br.ForcedProvider() != "" {
+		t.Fatalf("ClearForce mode=%s forced=%q", br.Mode(), br.ForcedProvider())
+	}
+
+	br.SetForce("anthropic", "")
+	br.SetMode(route.ModeJev)
+	if br.Mode() != route.ModeJev || br.ForcedProvider() != "" {
+		t.Fatalf("SetMode(jev) must clear force: %s %q", br.Mode(), br.ForcedProvider())
+	}
+	found := false
+	for _, l := range logs {
+		if l == "ROUTE MODE jev" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing ROUTE MODE log: %v", logs)
+	}
+	if snap := br.Snapshot(); snap.Mode != "jev" {
+		t.Fatalf("snapshot mode=%q", snap.Mode)
+	}
+
+	// Round-trip.
+	br2 := breaker.New(path, time.Minute, true, nil)
+	if br2.Mode() != route.ModeJev {
+		t.Fatalf("reloaded mode=%s", br2.Mode())
+	}
+
+	// pinned keeps force.
+	br2.SetForce("glm", "")
+	br2.SetMode(route.ModePinned)
+	if br2.Mode() != route.ModePinned || br2.ForcedProvider() != "glm" {
+		t.Fatalf("pinned: %s %q", br2.Mode(), br2.ForcedProvider())
+	}
+
+	// SetMode(auto) clears force too.
+	br2.SetMode(route.ModeAuto)
+	if br2.ForcedProvider() != "" || br2.Mode() != route.ModeAuto {
+		t.Fatalf("auto: %s %q", br2.Mode(), br2.ForcedProvider())
+	}
+}
+
+func TestModeMissingOnLoadIsAuto(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"entries":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	br := breaker.New(path, time.Minute, true, nil)
+	if br.Mode() != route.ModeAuto {
+		t.Fatalf("mode=%s", br.Mode())
+	}
+	// Legacy file with forced provider but no mode ⇒ pinned.
+	if err := os.WriteFile(path, []byte(`{"entries":{},"forced_provider":"glm"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	br = breaker.New(path, time.Minute, true, nil)
+	if br.Mode() != route.ModePinned || br.ForcedProvider() != "glm" {
+		t.Fatalf("legacy pinned: %s %q", br.Mode(), br.ForcedProvider())
+	}
+	// Garbage mode ⇒ auto.
+	if err := os.WriteFile(path, []byte(`{"entries":{},"mode":"wat"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	br = breaker.New(path, time.Minute, true, nil)
+	if br.Mode() != route.ModeAuto {
+		t.Fatalf("garbage mode=%s", br.Mode())
+	}
+}
+
+func TestStateIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	var logs []string
+	br := breaker.New(path, time.Minute, true, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+
+	now := time.Now()
+	if st := br.State("anthropic", "absent", now); st != breaker.Closed {
+		t.Fatalf("missing entry state=%s", st)
+	}
+
+	// OPEN whose window has already expired: Decide would flip it to PROBE,
+	// rewrite state.json and log. State must only report it.
+	br.Open("anthropic", "m1", "rate_limit_error", now.Add(-time.Second), now.Add(-time.Minute))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := br.State("anthropic", "m1", now); st != breaker.Probe {
+		t.Fatalf("expired OPEN state=%s want PROBE", st)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("State rewrote state.json:\n%s\n---\n%s", before, after)
+	}
+	if e, ok := br.Entry("anthropic", "m1"); !ok || e.State != breaker.Open {
+		t.Fatalf("State mutated the entry: %+v ok=%v", e, ok)
+	}
+	for _, l := range logs {
+		if strings.Contains(l, "BREAKER PROBE") || strings.Contains(l, "BREAKER CLOSED") {
+			t.Fatalf("State logged a transition: %s", l)
+		}
+	}
+
+	// Live window stays OPEN.
+	br.Open("anthropic", "m2", "rate_limit_error", now.Add(time.Hour), now)
+	if st := br.State("anthropic", "m2", now); st != breaker.Open {
+		t.Fatalf("live OPEN state=%s", st)
+	}
+	// Already-probed entry reports PROBE.
+	if st := br.Decide("anthropic", "m1", now); st != breaker.Probe {
+		t.Fatalf("Decide after State=%s want PROBE", st)
+	}
+	if st := br.State("anthropic", "m1", now); st != breaker.Probe {
+		t.Fatalf("probe state=%s", st)
+	}
+}
+
+func TestStateWithoutProbesIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	var logs []string
+	br := breaker.New(path, time.Minute, false, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	now := time.Now()
+	br.Open("anthropic", "m1", "rate_limit_error", now.Add(-time.Second), now.Add(-time.Minute))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// probe_on_expiry=false: an expired window reads as CLOSED — but State must
+	// not delete the entry the way Decide would.
+	if st := br.State("anthropic", "m1", now); st != breaker.Closed {
+		t.Fatalf("state=%s want CLOSED", st)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("State rewrote state.json:\n%s\n---\n%s", before, after)
+	}
+	if _, ok := br.Entry("anthropic", "m1"); !ok {
+		t.Fatal("State deleted the entry")
+	}
+	if len(logs) != 1 || !strings.HasPrefix(logs[0], "BREAKER OPEN") {
+		t.Fatalf("State logged something beyond the Open itself: %v", logs)
 	}
 }
