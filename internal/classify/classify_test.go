@@ -25,7 +25,7 @@ func TestClassifyTable(t *testing.T) {
 			hdr: http.Header{
 				"Anthropic-Ratelimit-Unified-Status":   []string{"rejected"},
 				"Anthropic-Ratelimit-Unified-5h-Reset": []string{"9999999999"},
-				"Retry-After":                         []string{"1847"},
+				"Retry-After":                          []string{"1847"},
 			},
 			body:   `{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}`,
 			want:   classify.Quota,
@@ -173,6 +173,17 @@ func TestProactiveRemainingDisabled(t *testing.T) {
 	ok, _, _ := classify.ProactiveQuota(hdr, 0, 0)
 	if ok {
 		t.Fatal("proactive_threshold=0 should disable remaining check")
+	}
+}
+
+func TestProactiveStatusHeaderIgnored(t *testing.T) {
+	hdr := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":   []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-5h-Reset": []string{itoa(time.Now().Add(time.Hour).Unix())},
+	}
+	ok, reason, _ := classify.ProactiveQuota(hdr, 0, 0)
+	if ok {
+		t.Fatalf("2xx -status header must not open breaker, got reason=%s", reason)
 	}
 }
 

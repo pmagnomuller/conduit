@@ -24,8 +24,8 @@ type Record struct {
 }
 
 type Writer struct {
-	mu   sync.Mutex
-	path string
+	mu      sync.Mutex
+	path    string
 	enabled bool
 }
 

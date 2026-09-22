@@ -27,8 +27,8 @@ func RouteFile() string {
 }
 
 type Route struct {
-	Provider string    `json:"provider"` // anthropic | glm | deepseek
-	Model    string    `json:"model,omitempty"`
+	Provider string `json:"provider"` // anthropic | glm | deepseek
+	Model    string `json:"model,omitempty"`
 	// UpstreamModel is the rewritten model actually sent to the provider
 	// (e.g. glm-5.2, deepseek-v4-flash); equals Model on the anthropic path.
 	UpstreamModel string    `json:"upstream_model,omitempty"`

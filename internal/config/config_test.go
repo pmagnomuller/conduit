@@ -78,6 +78,20 @@ func TestMapModelDeepSeekDefault(t *testing.T) {
 	}
 }
 
+func TestMapModelLongestPrefixDeterministic(t *testing.T) {
+	cfg := config.Default()
+	cfg.GLM.ModelMap = map[string]string{
+		"claude-sonnet-5":          "glm-5.3",
+		"claude-sonnet-5-20251001": "glm-5.3-flash",
+	}
+	for i := 0; i < 100; i++ {
+		m, ok := cfg.MapModel("claude-sonnet-5-20251001-extra")
+		if !ok || m != "glm-5.3-flash" {
+			t.Fatalf("iter %d: got %q ok=%v, want glm-5.3-flash", i, m, ok)
+		}
+	}
+}
+
 func TestLoadDeepSeekKeyOptional(t *testing.T) {
 	t.Setenv("ZAI_API_KEY", "k")
 	t.Setenv("DEEPSEEK_API_KEY", "")

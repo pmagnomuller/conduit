@@ -396,10 +396,19 @@ func mapModel(defaultModel string, mm map[string]string, anthropicModel string) 
 		return m, true
 	}
 	// Prefix / fuzzy: if exact miss, try longest prefix match on known keys.
+	// Map iteration order is random, so scan all candidates and keep the
+	// longest matching key rather than returning the first hit.
+	bestKey, bestVal := "", ""
 	for k, v := range mm {
-		if strings.HasPrefix(anthropicModel, k) && v != "" {
-			return v, true
+		if v == "" || !strings.HasPrefix(anthropicModel, k) {
+			continue
 		}
+		if len(k) > len(bestKey) {
+			bestKey, bestVal = k, v
+		}
+	}
+	if bestKey != "" {
+		return bestVal, true
 	}
 	if defaultModel != "" {
 		return defaultModel, true

@@ -12,12 +12,12 @@ import (
 type Kind int
 
 const (
-	OK Kind = iota
-	Quota       // open breaker, fail over to GLM
-	Transient   // retry Anthropic; do NOT fail over
-	Auth        // 401 / permission — surface to client; never fail over
-	ClientError // 400 etc — surface; never fail over
-	Other       // unexpected; surface; never fail over
+	OK          Kind = iota
+	Quota            // open breaker, fail over to GLM
+	Transient        // retry Anthropic; do NOT fail over
+	Auth             // 401 / permission — surface to client; never fail over
+	ClientError      // 400 etc — surface; never fail over
+	Other            // unexpected; surface; never fail over
 )
 
 func (k Kind) String() string {
@@ -158,28 +158,22 @@ func unifiedStatus(hdr http.Header) string {
 	return ""
 }
 
-// ProactiveQuota reports whether response headers indicate the subscription
-// quota is exhausted or below configured thresholds — without requiring a 429.
+// ProactiveQuota reports whether response headers indicate the subscription is
+// about to run out — via the configured utilization/remaining thresholds — on a
+// successful response, before a 429 ever arrives.
+//
+// It deliberately does NOT act on anthropic-ratelimit-unified-status:
+// a 2xx response means the request succeeded, and an "exceeded"/"rejected"/
+// "rate_limited" status there is a misleading signal that has been observed on
+// healthy 200s. A genuinely rejected request comes back as a 429, which
+// ClassifyAnthropic handles. Both thresholds are 0 (disabled) by default.
 func ProactiveQuota(hdr http.Header, remainingThreshold int, utilizationThreshold float64) (bool, string, time.Time) {
 	until := untilFromHeaders(hdr, time.Time{})
-
-	status := strings.ToLower(hdr.Get("anthropic-ratelimit-unified-status"))
-	if status == "exceeded" || status == "rejected" || status == "rate_limited" {
-		return true, "unified_status_" + status, until
-	}
 
 	for k, vals := range hdr {
 		lk := strings.ToLower(k)
 		if !strings.HasPrefix(lk, "anthropic-ratelimit-unified-") {
 			continue
-		}
-		if strings.HasSuffix(lk, "-status") {
-			for _, v := range vals {
-				lv := strings.ToLower(v)
-				if lv == "exceeded" || lv == "rejected" || lv == "rate_limited" {
-					return true, lk + "=" + lv, until
-				}
-			}
 		}
 		if utilizationThreshold > 0 && strings.HasSuffix(lk, "-utilization") {
 			for _, v := range vals {

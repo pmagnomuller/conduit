@@ -7,11 +7,11 @@ import (
 )
 
 var sensitiveHeaderNames = map[string]struct{}{
-	"authorization":   {},
-	"x-api-key":       {},
-	"anthropic-beta":  {}, // may carry oauth beta; redact value entirely when logging
-	"cookie":          {},
-	"set-cookie":      {},
+	"authorization":       {},
+	"x-api-key":           {},
+	"anthropic-beta":      {}, // may carry oauth beta; redact value entirely when logging
+	"cookie":              {},
+	"set-cookie":          {},
 	"proxy-authorization": {},
 }
 
@@ -50,9 +50,9 @@ func HeadersMap(h http.Header) map[string]string {
 }
 
 var (
-	bearerRE  = regexp.MustCompile(`(?i)(Bearer\s+)[^\s"']+`)
-	apiKeyRE  = regexp.MustCompile(`(?i)(x-api-key["'\s:=]+)[^\s"',}]+`)
-	skRE      = regexp.MustCompile(`(?i)\b(sk-ant-[a-z0-9\-_]+|sk-[a-z0-9]{20,})\b`)
+	bearerRE = regexp.MustCompile(`(?i)(Bearer\s+)[^\s"']+`)
+	apiKeyRE = regexp.MustCompile(`(?i)(x-api-key["'\s:=]+)[^\s"',}]+`)
+	skRE     = regexp.MustCompile(`(?i)\b(sk-ant-[a-z0-9\-_]+|sk-[a-z0-9]{20,})\b`)
 )
 
 // String redacts credential-like substrings from arbitrary text (log lines, bodies).
