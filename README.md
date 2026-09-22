@@ -137,9 +137,11 @@ one-off giant `model` string cannot blow up the UI's 2 s poll.
 {"at":"2026-09-22T10:14:03.512Z","requested_model":"claude-sonnet-5","provider":"glm","model":"glm-5.3-flash","step":"tool_step","lease":"tool_chain","source":"jev","confidence":0.81,"latency_ms":412}
 ```
 
-**Honesty caveat.** Jev decides from short capability/cost *priors* in the
-catalog (`[[jev.catalog]]` profiles), not from measured output quality — it
-has never seen the models' answers. Each non-leased call adds roughly one
+**Honesty caveat.** Jev decides from short capability *priors* in the catalog
+(`[[jev.catalog]]` profiles), not from measured output quality — it has never
+seen the models' answers. The built-in policy is capability-first: it picks the
+strongest model that will do the work, and steps down only for genuinely
+mechanical steps. Each non-leased call adds roughly one
 round-trip of latency (~200–800 ms typical, 4 s cap, then fail-open). If that
 trade is wrong for you, stay in `auto`.
 

@@ -92,22 +92,34 @@ type JevConfig struct {
 type Candidate struct {
 	Provider string `json:"provider" toml:"provider"` // anthropic|glm|deepseek
 	Model    string `json:"model"    toml:"model"`
-	Profile  string `json:"profile"  toml:"profile"` // capability/cost prior sent to Jev as criteria text
+	Profile  string `json:"profile"  toml:"profile"` // capability prior sent to Jev as criteria text
 }
 
 // Key is the catalog key sent to Jev, e.g. "anthropic/claude-opus-5".
 func (c Candidate) Key() string { return c.Provider + "/" + c.Model }
 
 // DefaultCatalog returns the built-in candidate set. Profiles are terse
-// priors: Jev sees them as criteria text and picks the cheapest sufficient one.
+// priors: Jev sees them as criteria text and picks the best model for the work.
+// Only ids verified to serve themselves belong here — retired provider ids can
+// answer 200 while a weaker model serves the request (see the alias issue).
 func DefaultCatalog() []Candidate {
 	return []Candidate{
-		{Provider: "anthropic", Model: "claude-opus-5", Profile: "Hardest work: architecture, security/concurrency review, ambiguous broad tasks, multi-file debugging. Most expensive."},
-		{Provider: "anthropic", Model: "claude-sonnet-5", Profile: "Complex implementation, inferring intent, cross-file refactors, robust tests. Expensive."},
-		{Provider: "anthropic", Model: "claude-haiku-4-5", Profile: "Trivial work: titles, summaries, a single mechanical edit with a known target. Cheap on-plan."},
-		{Provider: "glm", Model: "glm-5.3", Profile: "Bounded implementation with clear requirements and known patterns. Cheap, off-plan."},
-		{Provider: "glm", Model: "glm-5.3-flash", Profile: "Mechanical follow-through, formatting, simple tool continuations. Cheapest."},
-		{Provider: "deepseek", Model: "deepseek-v4-flash", Profile: "Bounded implementation; cheap alternative to glm-5.3. Only available when DEEPSEEK_API_KEY is set."},
+		{Provider: "anthropic", Model: "claude-fable-5-1",
+			Profile: "Strongest available. Long-horizon agentic work, hard architecture, gnarly debugging, security or concurrency review, anything where a wrong call is costly to undo."},
+		{Provider: "anthropic", Model: "claude-opus-5",
+			Profile: "Frontier reasoning and coding, second only to fable-5-1. Ambiguous broad tasks, multi-file design, subtle correctness."},
+		{Provider: "anthropic", Model: "claude-sonnet-5",
+			Profile: "Strong general implementation: cross-file refactors, feature work with clear requirements, robust tests."},
+		{Provider: "anthropic", Model: "claude-haiku-4-5",
+			Profile: "Light, fast work only: a title, a summary, one mechanical edit with a known target, a trivial tool continuation."},
+		{Provider: "glm", Model: "glm-5.3",
+			Profile: "Capable coding model off the Claude plan: bounded implementation with clear requirements and known patterns."},
+		{Provider: "glm", Model: "glm-5.3-flash",
+			Profile: "Lighter GLM tier: mechanical follow-through, formatting, simple tool continuations."},
+		{Provider: "deepseek", Model: "deepseek-v4-pro",
+			Profile: "Strongest DeepSeek tier: reasoning-heavy implementation and debugging. Needs DEEPSEEK_API_KEY."},
+		{Provider: "deepseek", Model: "deepseek-v4-flash",
+			Profile: "Cheapest tier, bounded mechanical work only. Needs DEEPSEEK_API_KEY. The retired ids deepseek-chat and deepseek-reasoner are aliases to this model, not stronger tiers."},
 	}
 }
 

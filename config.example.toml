@@ -76,9 +76,9 @@ decisions_path = "~/.local/state/conduit/decisions.jsonl"
 # [[jev.catalog]]
 # provider = "anthropic"
 # model = "claude-sonnet-5"
-# profile = "Complex implementation, cross-file refactors, robust tests. Expensive."
+# profile = "Strong general implementation: cross-file refactors, feature work with clear requirements."
 #
 # [[jev.catalog]]
 # provider = "glm"
 # model = "glm-5.3-flash"
-# profile = "Mechanical follow-through and simple tool continuations. Cheapest."
+# profile = "Lighter tier: mechanical follow-through and simple tool continuations."

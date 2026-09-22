@@ -165,12 +165,25 @@ func TestJevDefaultsAndMissingKey(t *testing.T) {
 	if !strings.HasSuffix(j.DecisionsPath, "/.local/state/conduit/decisions.jsonl") || strings.HasPrefix(j.DecisionsPath, "~") {
 		t.Fatalf("decisions_path=%q", j.DecisionsPath)
 	}
-	if len(j.Catalog) != 6 || j.Catalog[0].Key() != "anthropic/claude-opus-5" || j.Catalog[5].Key() != "deepseek/deepseek-v4-flash" {
-		t.Fatalf("catalog=%+v", j.Catalog)
+	// Capability-first policy: the strongest model leads the list and every
+	// provider the gateway can reach is represented. Asserting the shape rather
+	// than fixed indices keeps this honest when the catalog is retuned.
+	if len(j.Catalog) != 8 {
+		t.Fatalf("catalog has %d entries: %+v", len(j.Catalog), j.Catalog)
 	}
+	if j.Catalog[0].Key() != "anthropic/claude-fable-5-1" {
+		t.Fatalf("first catalog entry = %q, want the strongest anthropic model", j.Catalog[0].Key())
+	}
+	providers := map[string]bool{}
 	for _, c := range j.Catalog {
+		providers[c.Provider] = true
 		if c.Profile == "" {
 			t.Fatalf("empty profile for %s", c.Key())
+		}
+	}
+	for _, p := range []string{"anthropic", "glm", "deepseek"} {
+		if !providers[p] {
+			t.Fatalf("catalog has no %s candidate: %+v", p, j.Catalog)
 		}
 	}
 }

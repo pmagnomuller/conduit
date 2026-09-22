@@ -1,5 +1,5 @@
 // Package route implements per-call model routing backed by Jev (TypeSafe
-// System One). The gateway asks Jev to pick the cheapest sufficient
+// System One). The gateway asks Jev to pick the best-suited
 // provider/model from a catalog, using a bounded dossier of the inbound
 // request; any failure falls open so the caller keeps today's auto behaviour.
 package route
