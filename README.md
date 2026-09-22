@@ -69,7 +69,7 @@ falls back to `curl` + `jq` when it is not.
 |---|---|
 | `auto` (default) | Anthropic; breaker OPEN → GLM → DeepSeek. Today's behaviour. |
 | `pinned` | Every request to the provider/model you pinned (`forced_provider`/`forced_model`). Breaker ignored. |
-| `jev` | Per call, ask **Jev** (TypeSafe System One) to pick provider+model from a small catalog. Breaker still wins. Off unless `TYPESAFE_API_KEY` is set. |
+| `jev` | Per call, ask **Jev** (TypeSafe System One) to pick the best-suited provider+model from the catalog — capability-first, across all three providers. Breaker still wins. Off unless `TYPESAFE_API_KEY` is set. |
 
 Switch in the UI (mode selector) or from Claude Code:
 
@@ -148,6 +148,68 @@ trade is wrong for you, stay in `auto`.
 The idea and the System One question format come from
 [jev-codex-router](https://github.com/0xNatoshi/jev-codex-router).
 
+### Routing policy and catalog
+
+Jev is asked one question per call: *which of these models is best suited to
+the work that remains?* The instruction it gets is capability-first — use the
+strongest model that will do the work well, step down only for a step that is
+genuinely mechanical (a known-target edit, a title, a formatting pass, a routine
+tool continuation), and never pick a weaker model because it is cheaper. The
+ladder is stated per provider because Jev sees the candidates as an unordered
+map:
+
+| provider | ladder (strongest → lightest) |
+|---|---|
+| anthropic | `claude-fable-5-1` › `claude-opus-5` › `claude-sonnet-5` › `claude-haiku-4-5` |
+| glm | `glm-5.3` › `glm-5.3-flash` |
+| deepseek | `deepseek-v4-pro` › `deepseek-v4-flash` |
+
+Those eight entries are the built-in catalog. Each carries a one-line
+*profile* — the prior Jev reads when choosing — and that text is the tuning
+lever. To change the policy, override the catalog in `config.toml`; defining
+any entry replaces the whole default list:
+
+```toml
+[[jev.catalog]]
+provider = "anthropic"
+model = "claude-opus-5"
+profile = "Frontier reasoning and coding. Ambiguous broad tasks, multi-file design, subtle correctness."
+
+[[jev.catalog]]
+provider = "glm"
+model = "glm-5.3"
+profile = "Capable coding model off the Claude plan: bounded implementation with clear requirements."
+```
+
+Only list ids that actually serve themselves. Retired provider ids can answer
+`200` while a weaker model does the work — `deepseek-chat` and
+`deepseek-reasoner` both return `deepseek-v4-flash` today — so a "reasoner"
+entry would promise a tier the request never gets (issue #15).
+
+Watch what it does before trusting it:
+
+```bash
+conduitctl decisions -n 20        # requested → chosen, step, lease, source, confidence, latency
+conduitctl route                  # mode and who served the last request
+```
+
+The same feed in the control UI — one session, all three providers, with the
+confidence Jev attached to each pick. This capture ran with a six-entry
+`[[jev.catalog]]` override (no `sonnet`, no `haiku`), so requests for those ids
+were re-homed by capability: `claude-sonnet-5` went to `glm-5.3` or
+`deepseek-v4-flash` on lighter turns and *up* to `claude-fable-5-1` when the
+work warranted it, while `claude-fable-5-1` and `claude-opus-5` stayed where
+they were asked.
+
+![Jev decisions in the control UI](docs/jev-decisions.png)
+
+A healthy session shows `src=lease` on most tool continuations and `src=jev`
+on new user turns; a stream of `src=fail_open` means Jev is unreachable and
+you are getting plain `auto` routing.
+
+For the full mechanics — the dossier, leases, fail-open, the breaker's
+precedence — see [ARCHITECTURE.md](ARCHITECTURE.md#4-jev-routing-internalroute).
+
 ## Clients
 
 **Claude Code** (default) — `./setup.sh` points it at the gateway
@@ -163,6 +225,11 @@ Anthropic credential to forward. Models appear in OpenCode as
 removes the entry again.
 
 ## Architecture
+
+The request path in one picture; the full walkthrough — every branch of the
+dispatcher, the error classifier, the breaker's states, what Jev sees, what
+lives on disk, and how the repo is laid out — is in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```mermaid
 flowchart TD
@@ -334,7 +401,9 @@ rewrites only the JSON `model` field using `[glm.model_map]` /
 | haiku | `glm-5.3-flash` | `deepseek-v4-flash` |
 | anything else | `glm-5.3` | `deepseek-v4-flash` |
 
-A pinned model (via UI or `/_gateway/route`) overrides all of the above.
+A pinned model (via UI or `/_gateway/route`) overrides all of the above, and so
+does a Jev pick in `jev` mode — including on the Anthropic path when Jev chooses
+a different Claude model than the one requested.
 
 ## Tests
 
