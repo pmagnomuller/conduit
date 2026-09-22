@@ -9,6 +9,7 @@ source "${ROOT}/scripts/lib.sh"
 
 ensure_go
 build_gateway
+build_conduitctl
 ensure_config
 ensure_env
 # Optional: TYPESAFE_API_KEY for Jev routing mode (CONDUIT_SKIP_JEV_PROMPT=1 skips).

@@ -884,11 +884,20 @@ func (g *Gateway) logRequest(r *http.Request, model, upstreamModel, provider str
 	if upstreamModel == "" {
 		upstreamModel = model
 	}
-	g.lastMu.Lock()
-	g.lastProvider = provider
-	g.lastUpstream = upstreamModel
-	g.lastAt = time.Now()
-	g.lastMu.Unlock()
+	// Only a real model call may move the "now routing" snapshot behind
+	// lastRequestSnapshot. Every proxied request passes through here, including
+	// model-less ones (a browser's /favicon.ico GET), and a model-less call has
+	// no model to attribute: recording it lets the upstream that 404s an asset
+	// overwrite the provider actually serving traffic, which is actively
+	// misleading during a failover. The structured log line below still covers
+	// those requests, which is what diagnostics want.
+	if model != "" {
+		g.lastMu.Lock()
+		g.lastProvider = provider
+		g.lastUpstream = upstreamModel
+		g.lastAt = time.Now()
+		g.lastMu.Unlock()
+	}
 	attrs := []any{
 		"method", r.Method,
 		"path", r.URL.Path,

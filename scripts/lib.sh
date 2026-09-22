@@ -10,6 +10,9 @@ APP_NAME="conduit"
 LABEL="com.pedro.conduit"
 BIN_DIR="${HOME}/.local/bin"
 BIN="${BIN_DIR}/conduit"
+# The control client (cmd/conduit). Deliberately NOT installed as `conduit`:
+# scripts/conduit-run and the launchd plist exec that path as the gateway.
+CTL_BIN="${BIN_DIR}/conduitctl"
 CONFIG_DIR="${CONFIG_DIR:-${HOME}/.config/conduit}"
 STATE_DIR="${STATE_DIR:-${HOME}/.local/state/conduit}"
 CONFIG="${CONFIG_DIR}/config.toml"
@@ -44,6 +47,32 @@ build_gateway() {
 	mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$STATE_DIR"
 	echo "Building ${BIN} …"
 	(cd "$ROOT" && go build -o "$BIN" ./cmd/gateway)
+}
+
+# build_conduitctl installs the control client beside the gateway. Idempotent
+# and non-interactive: an existing binary is simply replaced, and a failure to
+# build it must not fail setup, since the gateway is the part that matters.
+build_conduitctl() {
+	mkdir -p "$BIN_DIR"
+	(cd "$ROOT" && go build -o "$CTL_BIN" ./cmd/conduit) || {
+		echo "warning: could not build ${CTL_BIN}; the gateway is unaffected" >&2
+		return 0
+	}
+	echo "Building ${CTL_BIN} …"
+}
+
+# conduitctl_bin echoes the control client to use, if one is installed: either
+# on PATH or at the path setup.sh installs it to. Empty when absent, which is
+# how callers keep their pre-CLI behaviour.
+conduitctl_bin() {
+	# $CTL_BIN first, then PATH: `make conduitctl` leaves a ./conduitctl in the
+	# repo root, and a repo dir on PATH would otherwise shadow the installed
+	# binary with a stale build.
+	if [[ -x "$CTL_BIN" ]]; then
+		printf '%s' "$CTL_BIN"
+		return 0
+	fi
+	command -v conduitctl 2>/dev/null || true
 }
 
 ensure_config() {
@@ -434,19 +463,27 @@ wait_healthy() {
 status_service() {
 	if curl -sf "${GATEWAY_URL}/_gateway/health" >/dev/null 2>&1; then
 		echo "health: ok  (${GATEWAY_URL})"
-		local st
-		st="$(curl -s "${GATEWAY_URL}/_gateway/status" 2>/dev/null || true)"
-		printf '%s\n' "$st"
-		# mode / jev_enabled are newer fields; print only when present and jq exists.
-		if [[ -n "$st" ]] && command -v jq >/dev/null 2>&1; then
-			local mode jev
-			mode="$(printf '%s' "$st" | jq -r '.mode // empty' 2>/dev/null || true)"
-			jev="$(printf '%s' "$st" | jq -r 'if has("jev_enabled") then (.jev_enabled|tostring) else empty end' 2>/dev/null || true)"
-			if [[ -n "$mode" ]]; then
-				echo "mode: ${mode}"
-			fi
-			if [[ -n "$jev" ]]; then
-				echo "jev_enabled: ${jev}"
+		local ctl
+		ctl="$(conduitctl_bin)"
+		if [[ -n "$ctl" ]]; then
+			# The CLI reads the same endpoint and needs no jq; fall back to
+			# the raw payload plus the jq block when it is not installed.
+			"$ctl" status || true
+		else
+			local st
+			st="$(curl -s "${GATEWAY_URL}/_gateway/status" 2>/dev/null || true)"
+			printf '%s\n' "$st"
+			# mode / jev_enabled are newer fields; print only when present and jq exists.
+			if [[ -n "$st" ]] && command -v jq >/dev/null 2>&1; then
+				local mode jev
+				mode="$(printf '%s' "$st" | jq -r '.mode // empty' 2>/dev/null || true)"
+				jev="$(printf '%s' "$st" | jq -r 'if has("jev_enabled") then (.jev_enabled|tostring) else empty end' 2>/dev/null || true)"
+				if [[ -n "$mode" ]]; then
+					echo "mode: ${mode}"
+				fi
+				if [[ -n "$jev" ]]; then
+					echo "jev_enabled: ${jev}"
+				fi
 			fi
 		fi
 	else
@@ -469,6 +506,9 @@ uninstall_service() {
 		rm -f "$PLIST_DST"
 	fi
 	unpatch_claude_settings
+	# conduitctl is new and ours: clear it, leaving the gateway binary and
+	# CONFIG_DIR handling exactly as they were before.
+	rm -f "$CTL_BIN"
 	echo "Left ${CONFIG_DIR} in place (contains your key). Delete it by hand if you want a clean slate."
 	echo "Restart Claude Code so it stops using ${GATEWAY_URL}."
 }

@@ -1,6 +1,7 @@
 # Binaries
 claude-glm-gateway
 /conduit
+/conduitctl
 *.exe
 *.test
 

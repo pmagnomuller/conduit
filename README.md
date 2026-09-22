@@ -42,6 +42,27 @@ Forced routing persists in `state.json` across restarts. Pinning `anthropic`
 suppresses failover (quota errors surface raw); pinning `glm`/`deepseek` pins
 every request to that provider with the model you choose.
 
+## Control CLI
+
+`./setup.sh` also installs `~/.local/bin/conduitctl` — a thin client for the
+same endpoints, no `jq` and no config file needed:
+
+```bash
+conduitctl route                            # mode, pin, who served the last request
+conduitctl route auto                       # back to automatic
+conduitctl route jev                        # let Jev pick per call
+conduitctl route pin glm glm-5.3            # → pinned
+conduitctl status                           # mode, routing, breaker countdowns, counters
+conduitctl status -json                     # the raw /_gateway/status payload
+conduitctl decisions -n 5                   # tail ~/.local/state/conduit/decisions.jsonl
+conduitctl ui                               # open the control page
+```
+
+It talks to `http://127.0.0.1:8787` (`CONDUIT_GATEWAY_URL` overrides) and says
+`gateway not reachable at … is it running? (./status.sh)` instead of dumping a
+Go error when nothing is listening. `./status.sh` uses it when installed and
+falls back to `curl` + `jq` when it is not.
+
 ## Routing modes
 
 | mode | behaviour |
@@ -59,6 +80,8 @@ Switch in the UI (mode selector) or from Claude Code:
 !curl -s -X POST localhost:8787/_gateway/route -d '{"clear":true}'                         # → auto
 curl -s localhost:8787/_gateway/route | jq '.mode, .jev.recent[:3]'
 ```
+
+Or with the CLI: `conduitctl route jev|auto`, `conduitctl route pin glm glm-5.3`.
 
 `POST /_gateway/route` accepts `Content-Type: application/json` or
 `application/x-www-form-urlencoded` (what plain `curl -d` sends) and refuses a
@@ -212,7 +235,7 @@ it dies). Then **restart Claude Code**.
 ./status.sh        # health + breaker + routing mode
 ./stop.sh          # pause
 ./start.sh         # resume
-./uninstall.sh     # stop service and un-point Claude Code
+./uninstall.sh     # stop service, remove conduitctl, un-point Claude Code
 tail -f ~/.local/state/conduit/gateway.log
 ```
 
@@ -286,6 +309,8 @@ breaker. Details: [`FINDINGS.md`](./FINDINGS.md).
 | `CONDUIT_OTHER_GATEWAY_LABEL` | no | launchd label of another gateway to stop during setup |
 | `CONDUIT_LOCAL_TOKEN` | no | Marker credential for token-less clients (default `conduit-local`). Used by the OpenCode wiring |
 | `CONDUIT_LOCAL_PROVIDER` | no | Provider for local-token traffic: `glm` (default), `deepseek`, or `anthropic` |
+| `CONDUIT_GATEWAY_URL` | no | Gateway URL used by `conduitctl` (default `http://127.0.0.1:8787`) |
+| `CONDUIT_DECISIONS_PATH` | no | Decision log path for `conduitctl decisions` (default under `~/.local/state/conduit`) |
 | `CONDUIT_WIRE_OPENCODE` | no | Set to `1` to have `./setup.sh` wire OpenCode to the gateway |
 
 ## Model mapping

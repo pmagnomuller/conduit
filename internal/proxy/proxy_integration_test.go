@@ -1203,6 +1203,95 @@ func TestJevSkipsRequestsWithoutModel(t *testing.T) {
 	}
 }
 
+// A model-less request (the browser's /favicon.ico GET is what the gateway
+// actually sees) is proxied but is not a model call: it must not move the
+// "now routing" snapshot the status endpoint and the UI pill read. Otherwise an
+// upstream 404 of an asset reports that upstream as the provider serving
+// traffic, which is wrong precisely when it matters — mid-failover.
+func TestModellessRequestDoesNotMoveLastRequest(t *testing.T) {
+	f := &fakeUpstreams{}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"not_found_error","message":"Not Found"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Reset", "9999999999")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}`))
+	}
+	f.glm = okJSON("glm")
+
+	srv, br, _ := newGateway(t, f)
+
+	// Before any model call the snapshot is empty, and a model-less request must
+	// not fill it in.
+	res, err := http.Get(srv.URL + "/favicon.ico")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 404 || res.Header.Get("X-Conduit-Provider") != "anthropic" {
+		t.Fatalf("model-less request status=%d provider=%q; it is still proxied", res.StatusCode, res.Header.Get("X-Conduit-Provider"))
+	}
+	if lr := getRoute(t, srv.URL)["last_request"]; lr != nil {
+		t.Fatalf("last_request after model-less request = %v, want nil", lr)
+	}
+
+	// A real model call goes to Anthropic, quota-fails over to GLM, and moves it.
+	res2 := post(t, srv.URL+"/v1/messages", []byte(jevReq), fakeToken)
+	res2.Body.Close()
+	if res2.StatusCode != 200 || res2.Header.Get("X-Conduit-Provider") != "glm" {
+		t.Fatalf("model call status=%d provider=%q", res2.StatusCode, res2.Header.Get("X-Conduit-Provider"))
+	}
+	if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Open {
+		t.Fatalf("breaker=%s", st)
+	}
+	lr, _ := getRoute(t, srv.URL)["last_request"].(map[string]any)
+	if lr == nil || lr["provider"] != "glm" || lr["upstream_model"] != "glm-5.3" {
+		t.Fatalf("last_request after model call = %v", lr)
+	}
+	at, _ := lr["at"].(string)
+
+	// The favicon 404 must leave it untouched — same provider, same timestamp.
+	res3, err := http.Get(srv.URL + "/favicon.ico")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res3.Body.Close()
+	assertLast := func(where string, got map[string]any) {
+		t.Helper()
+		if got == nil || got["provider"] != "glm" || got["upstream_model"] != "glm-5.3" || got["at"] != at {
+			t.Fatalf("last_request %s = %v, want glm/glm-5.3 at %s", where, got, at)
+		}
+	}
+	assertLast("after model-less request", mustMap(t, getRoute(t, srv.URL)["last_request"]))
+
+	// /_gateway/status carries the same snapshot and must agree.
+	st, err := http.Get(srv.URL + "/_gateway/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status struct {
+		LastRequest map[string]any `json:"last_request"`
+	}
+	if err := json.NewDecoder(st.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	st.Body.Close()
+	assertLast("in /_gateway/status", status.LastRequest)
+}
+
+func mustMap(t *testing.T, v any) map[string]any {
+	t.Helper()
+	m, _ := v.(map[string]any)
+	return m
+}
+
 func TestJevFailOpenFallsToAuto(t *testing.T) {
 	d := &fakeDecider{enabled: true} // pick.Provider=="" ⇒ ok=false
 	f := &fakeUpstreams{decider: d}

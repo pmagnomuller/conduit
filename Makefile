@@ -1,4 +1,4 @@
-.PHONY: setup start stop status uninstall build test
+.PHONY: setup start stop status uninstall build conduitctl test
 
 setup:
 	./setup.sh
@@ -17,6 +17,11 @@ uninstall:
 
 build:
 	go build -o conduit ./cmd/gateway
+
+# conduitctl is the control client (cmd/conduit). It builds to its own name so
+# the gateway artifact path that setup.sh and the launchd plist exec never moves.
+conduitctl:
+	go build -o conduitctl ./cmd/conduit
 
 test:
 	go test ./...
