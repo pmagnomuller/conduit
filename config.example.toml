@@ -16,6 +16,7 @@ default_model = "glm-5.3"
 # Rewrite Anthropic model IDs → GLM IDs when the breaker is OPEN.
 # Unmapped IDs fall back to default_model above.
 [glm.model_map]
+"claude-opus-5-5" = "glm-5.3"
 "claude-opus-5" = "glm-5.3"
 "claude-sonnet-5" = "glm-5.3"
 "claude-haiku-4-5" = "glm-5.3-flash"

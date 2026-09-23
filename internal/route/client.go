@@ -27,7 +27,7 @@ const (
 	// is unordered, and a wrong-but-cheap choice is the failure mode we are
 	// explicitly not optimising for.
 	modelInstructions = "Choose the model best suited to the work that remains, using the strongest model that will do it well. " +
-		"Capability order, per provider: anthropic claude-fable-5-1 > claude-opus-5 > claude-sonnet-5 > claude-haiku-4-5; " +
+		"Capability order, per provider: anthropic claude-fable-5-1 > claude-opus-5-5 > claude-opus-5 > claude-sonnet-5 > claude-haiku-4-5; " +
 		"glm glm-5.3 > glm-5.3-flash; deepseek deepseek-v4-pro > deepseek-v4-flash. " +
 		"Pick low on a ladder only for a step that is genuinely mechanical: a known-target edit, a title or summary, a formatting pass, a routine tool continuation. " +
 		"Pick high for anything ambiguous, architectural, risky, unfamiliar, or where a wrong answer is expensive to undo. " +

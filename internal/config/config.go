@@ -106,8 +106,10 @@ func DefaultCatalog() []Candidate {
 	return []Candidate{
 		{Provider: "anthropic", Model: "claude-fable-5-1",
 			Profile: "Strongest available. Long-horizon agentic work, hard architecture, gnarly debugging, security or concurrency review, anything where a wrong call is costly to undo."},
+		{Provider: "anthropic", Model: "claude-opus-5-5",
+			Profile: "Frontier reasoning and coding, second only to fable-5-1. Ambiguous broad tasks, multi-file design, subtle correctness. Thinking always on; effort defaults to medium."},
 		{Provider: "anthropic", Model: "claude-opus-5",
-			Profile: "Frontier reasoning and coding, second only to fable-5-1. Ambiguous broad tasks, multi-file design, subtle correctness."},
+			Profile: "Previous Opus generation. Same class of work as opus-5-5 when that tier is unavailable."},
 		{Provider: "anthropic", Model: "claude-sonnet-5",
 			Profile: "Strong general implementation: cross-file refactors, feature work with clear requirements, robust tests."},
 		{Provider: "anthropic", Model: "claude-haiku-4-5",
@@ -135,6 +137,7 @@ func Default() Config {
 			APIKeyEnv:    "ZAI_API_KEY",
 			DefaultModel: "glm-5.3",
 			ModelMap: map[string]string{
+				"claude-opus-5-5":           "glm-5.3",
 				"claude-opus-5":             "glm-5.3",
 				"claude-sonnet-5":           "glm-5.3",
 				"claude-haiku-4-5":          "glm-5.3-flash",

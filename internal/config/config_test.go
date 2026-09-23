@@ -168,7 +168,7 @@ func TestJevDefaultsAndMissingKey(t *testing.T) {
 	// Capability-first policy: the strongest model leads the list and every
 	// provider the gateway can reach is represented. Asserting the shape rather
 	// than fixed indices keeps this honest when the catalog is retuned.
-	if len(j.Catalog) != 8 {
+	if len(j.Catalog) != 9 {
 		t.Fatalf("catalog has %d entries: %+v", len(j.Catalog), j.Catalog)
 	}
 	if j.Catalog[0].Key() != "anthropic/claude-fable-5-1" {

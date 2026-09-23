@@ -247,7 +247,7 @@ func sameOrigin(r *http.Request, origin string) bool {
 // availableModels lists selectable upstream models per provider for the UI.
 func (g *Gateway) availableModels() map[string][]string {
 	return map[string][]string{
-		"anthropic": {"claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"},
+		"anthropic": {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"},
 		"glm":       {"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-4.5-air"},
 		// deepseek-chat and deepseek-reasoner are retired ids that answer 200
 		// from deepseek-v4-flash: listing them would promise a tier that is not
