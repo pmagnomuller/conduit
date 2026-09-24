@@ -241,6 +241,36 @@ All derivable in `Extract` from data already parsed.
 - Tests: table-driven cases for the switch guard and policy filter with the
   existing `jevStub`.
 
+## Backlog (status 2026-09-24)
+
+Open items, highest value first. Shipped: #1, #3, #4, #5 (see above,
+ARCHITECTURE §4.4–4.6).
+
+- [ ] **Capture upstream `usage`** — parse input/output/cache tokens from the
+  provider response (SSE `message_start` / `message_delta`) into the decision
+  record. Completes #5 (output side, real token counts instead of bytes/4) and
+  gives shadow mode (#6) its measurements. Medium: streaming path.
+- [ ] **#6 Shadow mode** — sample traffic to Jev's pick, eval offline, feed
+  results back into profiles. Largest item; retires the README honesty caveat.
+- [ ] **#2 Noul "stay or switch" question** — separate *whether* from *where*;
+  may replace the lease question. Needs testing against the real Jev API.
+- [ ] **#7 Richer dossier** — `recent_tool_mix`, `error_streak`,
+  `turn_index_in_chain`. Small, all in `Extract`.
+- [ ] **Fix DeepSeek catalog id** — `deepseek-v4-flash` is retired upstream
+  and served by V4.1 Flash (`deepseek-flash`), breaking the README's
+  "only ids that serve themselves" rule. Update catalog entry, profile, price
+  and the DeepSeek model map together. Small.
+- [ ] **Sensitive turns in auto mode** — #4 covers jev mode only; with
+  Anthropic OPEN, auto (and jev fail-open) still fail over to GLM/DeepSeek.
+  Needs an availability decision (refuse / queue / allow) before code.
+- [ ] **Per-entry trust tiers** — #4 shipped as a provider-level
+  trusted/untrusted split; the plan's `trust` field + policy classes remain.
+- [ ] **Review new defaults** — switch guard, margin guard and restriction are
+  on by default; check real `decisions.jsonl` after a few sessions and tune
+  `max_switch_context`, `switch_confidence`, `min_margin`.
+- [ ] **#8 Housekeeping** — `dossier_mode = minimal` for privacy; UI cost
+  column; typed decision-source enum.
+
 ## Non-goals (for a gateway)
 
 Programmable permissions, tool routing / tiered disclosure, chunk visibility
