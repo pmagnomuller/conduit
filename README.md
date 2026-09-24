@@ -130,6 +130,14 @@ Configure with `restrict_sensitive`, `restricted_providers`,
 `restricted_patterns`. This covers jev mode only — auto mode's breaker
 failover still sends traffic to GLM/DeepSeek while Anthropic is OPEN.
 
+**Cost estimate.** Each decision logs `est_input_usd` (this call's input on
+the chosen model — cache-read rate only when it stays on a warm model) and
+`baseline_input_usd` (the same input on the requested model, as auto would
+send it); `conduitctl decisions` totals them. List prices, input only, and
+API-equivalent: a Claude plan or the GLM Coding Plan is not billed per token.
+Catalog entries take `price_in`, `price_out`, `price_cache_read` (USD/MTok);
+unset prices fall back to the built-in table.
+
 **Half-open probes bypass Jev.** When an Anthropic entry's open window has
 expired, that one call goes to Anthropic with the model you asked for (so the
 breaker can decide whether to close) rather than to Jev's pick — the same probe
@@ -204,7 +212,7 @@ entry would promise a tier the request never gets (issue #15).
 Watch what it does before trusting it:
 
 ```bash
-conduitctl decisions -n 20        # requested → chosen, step, lease, source, confidence, latency
+conduitctl decisions -n 20        # requested → chosen, step, lease, source, confidence, latency, est. input cost vs baseline
 conduitctl route                  # mode and who served the last request
 ```
 

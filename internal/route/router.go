@@ -32,8 +32,14 @@ type Decision struct {
 	// Pick is Jev's choice when the router overrode it (sticky, low_confidence).
 	Pick string `json:"pick,omitempty"`
 	// Policy is "restricted" when sensitive content limited the candidates.
-	Policy    string `json:"policy,omitempty"`
-	LatencyMS int64  `json:"latency_ms"`
+	Policy string `json:"policy,omitempty"`
+	// EstInputUSD prices this call's input on the chosen model (cache-read
+	// rate when it stays on a warm model); BaselineInputUSD the same call on
+	// the requested model, as auto would have sent it. Input only: output
+	// size is unknown at decision time. List-price estimates, 0 when unpriced.
+	EstInputUSD      float64 `json:"est_input_usd,omitempty"`
+	BaselineInputUSD float64 `json:"baseline_input_usd,omitempty"`
+	LatencyMS        int64   `json:"latency_ms"`
 }
 
 const (
@@ -90,6 +96,7 @@ type Router struct {
 	minMargin  float64
 	// restricted is non-nil when sensitive-turn filtering is on.
 	restricted *restriction
+	prices     map[string]config.Candidate // key → prices, default catalog overlaid by cfg
 	log        *slog.Logger
 	now        func() time.Time // injectable for lease tests
 
@@ -133,6 +140,7 @@ func New(cfg config.JevConfig, apiKey string, log *slog.Logger) *Router {
 		leases:     map[string]lease{},
 		history:    map[string]served{},
 	}
+	r.prices = priceTable(cfg.Catalog)
 	if cfg.RestrictSensitive && len(cfg.RestrictedProviders) > 0 {
 		r.restricted = newRestriction(cfg.RestrictedPatterns, cfg.RestrictedProviders, log)
 	}
@@ -201,6 +209,7 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		ld.Reason = ""
 		ld.Pick, ld.Margin = "", 0
 		ld.Policy = policyOf(dossier)
+		r.priceDecision(&ld, dossier)
 		ld.LatencyMS = r.now().Sub(start).Milliseconds()
 		r.remember(dossier, ld, start)
 		r.record(ld)
@@ -238,6 +247,7 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		d.Pick = res.Choice
 		d.Lease = LeaseOneCall
 	}
+	r.priceDecision(&d, dossier)
 	r.storeLease(dossier, d, start)
 	r.remember(dossier, d, start)
 	r.record(d)
@@ -270,6 +280,7 @@ func (r *Router) fillCurrent(d *Dossier, cands []Candidate, now time.Time) {
 	if !ok || now.Sub(h.at) >= r.ttl {
 		return
 	}
+	d.recentlyServed = now.Sub(h.at) < cacheWarmWindow
 	if !slices.ContainsFunc(cands, func(c Candidate) bool { return c.Key() == h.key }) {
 		return
 	}
@@ -298,6 +309,53 @@ func (r *Router) remember(d Dossier, dec Decision, now time.Time) {
 		}
 	}
 	r.history[d.fingerprint] = served{key: dec.Provider + "/" + dec.Model, at: now}
+}
+
+// priceTable merges prices: default catalog first, then any configured
+// entry's non-zero prices, so a catalog override without prices still gets
+// an estimate for the ids conduit knows.
+func priceTable(catalog []Candidate) map[string]config.Candidate {
+	t := map[string]config.Candidate{}
+	for _, c := range config.DefaultCatalog() {
+		t[c.Key()] = c
+	}
+	for _, c := range catalog {
+		p := t[c.Key()]
+		if c.PriceIn > 0 {
+			p.PriceIn = c.PriceIn
+		}
+		if c.PriceCacheRead > 0 {
+			p.PriceCacheRead = c.PriceCacheRead
+		}
+		if c.PriceOut > 0 {
+			p.PriceOut = c.PriceOut
+		}
+		t[c.Key()] = p
+	}
+	return t
+}
+
+// inputUSD prices tokens on key, at the cache-read rate when warm.
+func (r *Router) inputUSD(key string, tokens int, warm bool) float64 {
+	p, ok := r.prices[key]
+	if !ok {
+		return 0
+	}
+	rate := p.PriceIn
+	if warm && p.PriceCacheRead > 0 {
+		rate = p.PriceCacheRead
+	}
+	return float64(tokens) * rate / 1e6
+}
+
+// priceDecision fills the cost estimate. The chosen model is warm only when
+// the thread stays on it; the baseline (requested model, as auto sends it)
+// is warm whenever the thread was active, since auto would never have moved.
+// Cache-write premiums are ignored.
+func (r *Router) priceDecision(dec *Decision, d Dossier) {
+	key := dec.Provider + "/" + dec.Model
+	dec.EstInputUSD = r.inputUSD(key, d.ContextTokensEst, d.CacheWarm && d.Current == key)
+	dec.BaselineInputUSD = r.inputUSD("anthropic/"+d.RequestedModel, d.ContextTokensEst, d.recentlyServed)
 }
 
 func splitKey(key string) (provider, model string) {

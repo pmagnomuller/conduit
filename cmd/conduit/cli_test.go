@@ -607,3 +607,26 @@ func nonEmptyLines(s string) []string {
 	}
 	return out
 }
+
+func TestDecisionsCostSummary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "decisions.jsonl")
+	lines := []string{
+		`{"at":"2026-09-22T10:00:00Z","requested_model":"claude-opus-5","provider":"glm","model":"glm-5.3","step":"user_turn","lease":"one_call","source":"jev","est_input_usd":0.01,"baseline_input_usd":0.04,"latency_ms":1}`,
+		`{"at":"2026-09-22T10:00:01Z","requested_model":"claude-opus-5","provider":"glm","model":"glm-5.3","step":"tool_step","lease":"one_call","source":"lease","est_input_usd":0.01,"baseline_input_usd":0.01,"latency_ms":1}`,
+		`{"at":"2026-09-22T10:00:02Z","requested_model":"unpriced","provider":"glm","model":"glm-5.3","step":"other","lease":"one_call","source":"jev","est_input_usd":0.5,"latency_ms":1}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONDUIT_DECISIONS_PATH", path)
+	rc, out, errOut := runCLI(t, "decisions")
+	if rc != exitOK {
+		t.Fatalf("rc = %d, stderr = %s", rc, errOut)
+	}
+	if !strings.Contains(out, "in=$0.0100 base=$0.0400") {
+		t.Errorf("per-line cost missing:\n%s", out)
+	}
+	if !strings.Contains(out, "(list price, 2 calls): jev $0.0200 vs requested-model baseline $0.0500 (-60%)") {
+		t.Errorf("summary wrong:\n%s", out)
+	}
+}

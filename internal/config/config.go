@@ -141,34 +141,43 @@ type Candidate struct {
 	Provider string `json:"provider" toml:"provider"` // anthropic|glm|deepseek
 	Model    string `json:"model"    toml:"model"`
 	Profile  string `json:"profile"  toml:"profile"` // capability prior sent to Jev as criteria text
+	// List prices, USD per million tokens, for the decision log's cost
+	// estimate only (never sent to Jev: the policy is capability-first). 0 →
+	// fall back to the default catalog's price for the same key, if any.
+	PriceIn        float64 `json:"price_in,omitempty"         toml:"price_in"`
+	PriceOut       float64 `json:"price_out,omitempty"        toml:"price_out"`
+	PriceCacheRead float64 `json:"price_cache_read,omitempty" toml:"price_cache_read"`
 }
 
 // Key is the catalog key sent to Jev, e.g. "anthropic/claude-opus-5".
 func (c Candidate) Key() string { return c.Provider + "/" + c.Model }
 
-// DefaultCatalog returns the built-in candidate set. Profiles are terse
+// DefaultCatalog returns the built-in candidate set. Prices are list USD/MTok
+// as of 2026-09-24 (Anthropic API; z.ai API; DeepSeek peak-hour rates, which
+// are double off-peak). Anthropic traffic on a Claude plan and GLM on the
+// Coding Plan are not billed per token: read the estimate as API-equivalent. Profiles are terse
 // priors: Jev sees them as criteria text and picks the best model for the work.
 // Only ids verified to serve themselves belong here — retired provider ids can
 // answer 200 while a weaker model serves the request (see the alias issue).
 func DefaultCatalog() []Candidate {
 	return []Candidate{
-		{Provider: "anthropic", Model: "claude-fable-5-1",
+		{Provider: "anthropic", Model: "claude-fable-5-1", PriceIn: 10, PriceOut: 50, PriceCacheRead: 0.25,
 			Profile: "Strongest available. Long-horizon agentic work, hard architecture, gnarly debugging, security or concurrency review, anything where a wrong call is costly to undo."},
-		{Provider: "anthropic", Model: "claude-opus-5-5",
+		{Provider: "anthropic", Model: "claude-opus-5-5", PriceIn: 4, PriceOut: 20, PriceCacheRead: 0.20,
 			Profile: "Frontier reasoning and coding, second only to fable-5-1. Ambiguous broad tasks, multi-file design, subtle correctness. Thinking always on; effort defaults to medium."},
-		{Provider: "anthropic", Model: "claude-opus-5",
+		{Provider: "anthropic", Model: "claude-opus-5", PriceIn: 5, PriceOut: 25, PriceCacheRead: 0.50,
 			Profile: "Previous Opus generation. Same class of work as opus-5-5 when that tier is unavailable."},
-		{Provider: "anthropic", Model: "claude-sonnet-5",
+		{Provider: "anthropic", Model: "claude-sonnet-5", PriceIn: 2, PriceOut: 10, PriceCacheRead: 0.20,
 			Profile: "Strong general implementation: cross-file refactors, feature work with clear requirements, robust tests."},
-		{Provider: "anthropic", Model: "claude-haiku-4-5",
+		{Provider: "anthropic", Model: "claude-haiku-4-5", PriceIn: 1, PriceOut: 5, PriceCacheRead: 0.10,
 			Profile: "Light, fast work only: a title, a summary, one mechanical edit with a known target, a trivial tool continuation."},
-		{Provider: "glm", Model: "glm-5.3",
+		{Provider: "glm", Model: "glm-5.3", PriceIn: 1.40, PriceOut: 4.40, PriceCacheRead: 0.26,
 			Profile: "Capable coding model off the Claude plan: bounded implementation with clear requirements and known patterns."},
-		{Provider: "glm", Model: "glm-5.3-flash",
+		{Provider: "glm", Model: "glm-5.3-flash", PriceIn: 0.15, PriceOut: 0.50, PriceCacheRead: 0.03,
 			Profile: "Lighter GLM tier: mechanical follow-through, formatting, simple tool continuations."},
-		{Provider: "deepseek", Model: "deepseek-v4-pro",
+		{Provider: "deepseek", Model: "deepseek-v4-pro", PriceIn: 1.32, PriceOut: 3.96, PriceCacheRead: 0.044,
 			Profile: "Strongest DeepSeek tier: reasoning-heavy implementation and debugging. Needs DEEPSEEK_API_KEY."},
-		{Provider: "deepseek", Model: "deepseek-v4-flash",
+		{Provider: "deepseek", Model: "deepseek-v4-flash", PriceIn: 0.30, PriceOut: 1.20, PriceCacheRead: 0.006,
 			Profile: "Cheapest tier, bounded mechanical work only. Needs DEEPSEEK_API_KEY. The retired ids deepseek-chat and deepseek-reasoner are aliases to this model, not stronger tiers."},
 	}
 }

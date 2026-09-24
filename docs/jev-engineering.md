@@ -188,7 +188,7 @@ see ARCHITECTURE §4.5. Simpler than the plan above: one trusted/untrusted
 split by provider instead of per-entry trust tiers and policy classes. Gap:
 auto-mode breaker failover is not covered.
 
-### 5. Cost estimate per decision — medium
+### 5. Cost estimate per decision — ✅ implemented (input side)
 
 Catalog gets `price_in`, `price_out`, `price_cache_read` (per MTok). Per decision
 log `est_cost` (input at cache-read price if `cache_warm` and unchanged model,
@@ -196,6 +196,13 @@ else full input price) and `baseline_cost` (same call on `requested_model`).
 `conduitctl decisions --cost` sums delta per session. This tests the note's
 routing arithmetic against real conduit traffic — and would show whether jev
 mode saves or burns money.
+
+*Shipped as:* `price_in` / `price_out` / `price_cache_read` on catalog
+entries (defaults filled for all nine built-ins, list prices 2026-09-24);
+decisions log `est_input_usd` and `baseline_input_usd`; `conduitctl
+decisions` prints both per line plus a total with % delta. Input side only —
+output size is unknown at decision time. Capturing `usage` from the upstream
+response would complete it (and replace the bytes/4 token estimate).
 
 ### 6. Shadow mode (measured quality) — high value, larger
 

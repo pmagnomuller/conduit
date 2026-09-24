@@ -756,3 +756,44 @@ func TestRestrictedPatterns(t *testing.T) {
 		}
 	}
 }
+
+// Cost estimate: prices come from the default catalog when the configured
+// entry has none; staying on a warm model is priced at the cache-read rate,
+// and the baseline (requested model under auto) is warm once the thread is.
+func TestDecisionCostEstimate(t *testing.T) {
+	stub := &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, nil)
+	near := func(got, want float64) bool { return got > want*0.999 && got < want*1.001 }
+
+	d1, _ := r.Decide(context.Background(), userTurn(t, "first"), testCatalog)
+	tok := float64(stub.last.Load().State.ContextTokensEst)
+	if !near(d1.EstInputUSD, tok*0.15/1e6) || !near(d1.BaselineInputUSD, tok*5/1e6) {
+		t.Fatalf("cold: est=%v base=%v tok=%v", d1.EstInputUSD, d1.BaselineInputUSD, tok)
+	}
+
+	d2, _ := r.Decide(context.Background(), userTurn(t, "again"), testCatalog)
+	tok = float64(stub.last.Load().State.ContextTokensEst)
+	if !near(d2.EstInputUSD, tok*0.03/1e6) || !near(d2.BaselineInputUSD, tok*0.5/1e6) {
+		t.Fatalf("warm stay: est=%v base=%v", d2.EstInputUSD, d2.BaselineInputUSD)
+	}
+
+	stub.choice = "anthropic/claude-opus-5"
+	d3, _ := r.Decide(context.Background(), userTurn(t, "switch"), testCatalog)
+	tok = float64(stub.last.Load().State.ContextTokensEst)
+	if !near(d3.EstInputUSD, tok*5/1e6) || !near(d3.BaselineInputUSD, tok*0.5/1e6) {
+		t.Fatalf("switch pays full input: est=%v base=%v", d3.EstInputUSD, d3.BaselineInputUSD)
+	}
+}
+
+func TestPriceTableOverride(t *testing.T) {
+	tbl := priceTable([]Candidate{
+		{Provider: "glm", Model: "glm-5.3", PriceIn: 9},
+		{Provider: "x", Model: "y", PriceIn: 1, PriceCacheRead: 0.1},
+	})
+	if p := tbl["glm/glm-5.3"]; p.PriceIn != 9 || p.PriceCacheRead != 0.26 {
+		t.Fatalf("overlay: %+v", p)
+	}
+	if p := tbl["x/y"]; p.PriceIn != 1 {
+		t.Fatalf("new entry: %+v", p)
+	}
+}

@@ -263,19 +263,30 @@ fail-open without asking Jev. Patterns err toward matching: a false positive
 only keeps a turn on Anthropic. Scope is jev mode; auto's breaker failover is
 unchanged.
 
-### 4.6 Fail-open
+### 4.6 Cost estimate
+
+For every jev, lease, sticky and low_confidence decision the router prices the
+call's input (`context_tokens_est`) twice, from a price table built from the
+default catalog overlaid with configured prices: `est_input_usd` on the chosen
+key (cache-read rate iff it equals `current` and `cache_warm`) and
+`baseline_input_usd` on `anthropic/<requested_model>` (cache-read rate iff the
+thread was served within the cache window on any model — auto would not have
+moved it). Cache-write premiums and output are ignored; fail-open decisions
+are not priced. Prices never reach Jev.
+
+### 4.7 Fail-open
 
 `Decide` never blocks past the timeout, never panics (a `recover` converts a
 panic into a fail-open), and never surfaces an error to the client. Any
 failure yields `ok=false`; the proxy then serves the request exactly as
 `auto` would. The reason (redacted) is recorded.
 
-### 4.7 Records
+### 4.8 Records
 
 Every decision — including fail-open — goes to an in-memory ring (200, shown as
 `jev.recent` in the UI) and is appended to `decisions.jsonl` (mode 0600,
 rotated at 4 MiB to `decisions.jsonl.1`). Fields are the already-clipped
-dossier values plus provider, model, lease, source, confidence, margin, pick, policy, latency.
+dossier values plus provider, model, lease, source, confidence, margin, pick, policy, est/baseline input cost, latency.
 
 ---
 

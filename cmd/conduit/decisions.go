@@ -26,6 +26,8 @@ type decision struct {
 	Margin         float64   `json:"margin,omitempty"`
 	Pick           string    `json:"pick,omitempty"`
 	Policy         string    `json:"policy,omitempty"`
+	EstInputUSD    float64   `json:"est_input_usd,omitempty"`
+	BaseInputUSD   float64   `json:"baseline_input_usd,omitempty"`
 	LatencyMS      int64     `json:"latency_ms"`
 }
 
@@ -87,7 +89,8 @@ func runDecisions(args []string, stdout, stderr io.Writer) int {
 	if len(lines) > *n {
 		lines = lines[len(lines)-*n:]
 	}
-	var skipped int
+	var skipped, priced int
+	var est, base float64
 	for _, line := range lines {
 		var d decision
 		if err := json.Unmarshal([]byte(line), &d); err != nil {
@@ -97,6 +100,16 @@ func runDecisions(args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 		fmt.Fprintln(stdout, formatDecision(d))
+		// Totals compare only calls priced on both sides, so an unpriced
+		// requested id cannot make jev look free.
+		if d.EstInputUSD > 0 && d.BaseInputUSD > 0 {
+			priced++
+			est += d.EstInputUSD
+			base += d.BaseInputUSD
+		}
+	}
+	if priced > 0 {
+		fmt.Fprintln(stdout, formatCostSummary(priced, est, base))
 	}
 	if skipped > 0 {
 		fmt.Fprintf(stderr, "conduitctl: skipped %d unparseable line(s)\n", skipped)
@@ -105,6 +118,12 @@ func runDecisions(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "no decisions in %s yet\n", path)
 	}
 	return exitOK
+}
+
+// formatCostSummary compares estimated input spend against auto's baseline.
+func formatCostSummary(n int, est, base float64) string {
+	return fmt.Sprintf("input cost est (list price, %d calls): jev $%.4f vs requested-model baseline $%.4f (%+.0f%%)",
+		n, est, base, (est-base)/base*100)
 }
 
 // formatDecision is one line per decision: time, requested→chosen, step, lease,
@@ -133,6 +152,9 @@ func formatDecision(d decision) string {
 	}
 	if d.Policy != "" {
 		line += " policy=" + d.Policy
+	}
+	if d.EstInputUSD > 0 || d.BaseInputUSD > 0 {
+		line += fmt.Sprintf(" in=$%.4f base=$%.4f", d.EstInputUSD, d.BaseInputUSD)
 	}
 	line += fmt.Sprintf(" %dms", d.LatencyMS)
 	if d.Reason != "" {

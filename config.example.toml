@@ -115,3 +115,8 @@ restricted_providers = ["glm", "deepseek"]
 # provider = "glm"
 # model = "glm-5.3-flash"
 # profile = "Lighter tier: mechanical follow-through and simple tool continuations."
+# Optional list prices (USD per million tokens) for the decision log's cost
+# estimate; unset prices fall back to the built-in table.
+# price_in = 0.15
+# price_out = 0.50
+# price_cache_read = 0.03

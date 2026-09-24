@@ -62,6 +62,9 @@ type Dossier struct {
 
 	// fingerprint is the lease key; not sent to Jev.
 	fingerprint string
+	// recentlyServed: the thread made a routed call within the cache window,
+	// on any model. Baseline for the cost estimate; not sent to Jev.
+	recentlyServed bool
 	// recent is the raw content of the last imageLookback messages, scanned
 	// for sensitive paths by the router. Slices of the body, not copies.
 	recent []json.RawMessage
