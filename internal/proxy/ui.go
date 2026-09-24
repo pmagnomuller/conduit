@@ -11,6 +11,7 @@ const uiHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>conduit</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 512 512%22%3E %3Crect x=%2216%22 y=%2216%22 width=%22480%22 height=%22480%22 rx=%2296%22 fill=%22%23101418%22 stroke=%22%23263041%22 stroke-width=%2212%22/%3E %3Cg fill=%22none%22 stroke-linecap=%22round%22%3E %3Cpath d=%22M72 168 H168 Q264 168 296 256%22 stroke=%22%23f783ac%22 stroke-width=%2240%22/%3E %3Cpath d=%22M72 256 H296%22 stroke=%22%2374c0fc%22 stroke-width=%2240%22/%3E %3Cpath d=%22M72 344 H168 Q264 344 296 256%22 stroke=%22%2363e6be%22 stroke-width=%2240%22/%3E %3Cpath d=%22M296 256 H440%22 stroke=%22%238f9aa6%22 stroke-width=%2256%22/%3E %3C/g%3E %3Ccircle cx=%22296%22 cy=%22256%22 r=%2236%22 fill=%22%23101418%22 stroke=%22%23d8dee6%22 stroke-width=%2216%22/%3E %3C/svg%3E">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   :root {
