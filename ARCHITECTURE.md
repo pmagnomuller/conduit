@@ -50,9 +50,11 @@ flowchart TD
     JG -- no --> AUTO{breaker state}
     AUTO -- CLOSED --> AN["serveAnthropic"]
     AUTO -- PROBE --> ANP["serveAnthropic(probe)"]
-    AUTO -- OPEN --> GLM["serveGLM"]
-    AN -- "quota 429 / 403" --> GLM
-    GLM -- "unreachable · 401 · 403 · 408 · 429 · 5xx" --> DS["serveDeepSeek<br/>(only with DEEPSEEK_API_KEY)"]
+    AUTO -- OPEN --> FB["serveFailover"]
+    AN -- "quota 429 / 403" --> FB
+    FB -- "default: glm" --> GLM["serveGLM"]
+    FB -- "failover_provider=deepseek" --> DS["serveDeepSeek"]
+    GLM -- "unreachable · 401 · 403 · 408 · 429 · 5xx" --> DS
 ```
 
 ### 2.1 Pinned
@@ -72,7 +74,8 @@ Anthropic, so they are routed straight to `CONDUIT_LOCAL_PROVIDER`.
 `breaker.Decide` looks up the `(anthropic, model)` entry:
 
 - **CLOSED** (no entry) — Anthropic.
-- **OPEN** — the plan is exhausted for this model until `until`; go to GLM.
+- **OPEN** — the plan is exhausted for this model until `until`; go to the
+  failover tier (`failover_provider`, `glm` by default, `deepseek` opt-in).
 - **PROBE** — the open window expired; send *this one* request to Anthropic to
   find out. Success closes the entry, a fresh quota error re-opens it.
 
@@ -101,7 +104,9 @@ the inbound credential. Up to `1 + max_transient_retries` attempts; transient
 errors (5xx, 529, "not your usage limit" throttles) back off with jitter. A
 response classified as **Quota** opens the breaker for the model that was
 *actually sent* (which may be Jev's pick, not the requested id), then — if
-nothing has been written to the client yet — replays the request on GLM. Auth
+nothing has been written to the client yet — replays the request on the
+failover tier (`serveFailover` → `serveGLM` by default, `serveDeepSeek` when
+`failover_provider = "deepseek"`). Auth
 and client errors are surfaced untouched. On a 2xx, `ProactiveQuota` applies
 the opt-in `-remaining` / `-utilization` thresholds; it deliberately ignores
 the `unified-status` header on successful responses (see FINDINGS.md).
@@ -112,7 +117,9 @@ the `unified-status` header on successful responses (see FINDINGS.md).
 hand the request to DeepSeek if that tier is configured; otherwise the GLM
 error is surfaced.
 
-**`serveDeepSeek`** is the terminal tier. It rewrites the model and drops the
+**`serveDeepSeek`** serves the DeepSeek tier — the terminal fallback behind a
+failed GLM, or the primary failover when `failover_provider = "deepseek"`. It
+rewrites the model and drops the
 `Artifact` tool (DeepSeek's validator rejects its schema; if that was the only
 tool, the `tools` key is omitted). This is the one place the tool list is not
 forwarded verbatim, and it applies in every mode.
@@ -135,6 +142,7 @@ gateway from failing over on ordinary load is:
 |---|---|
 | 429 **with** `anthropic-ratelimit-unified-*` headers | Quota — open breaker |
 | 429 whose message says "not your usage limit" / "temporarily limiting", or without unified headers | Transient — retry Anthropic, never fail over |
+| 429 `rate_limit_error` **without** unified headers, with `treat_headerless_429_as_quota = true` | Quota — open breaker (opt-in) |
 | 403 `billing_error` or a billing/credit message | Quota |
 | 401, 403 `permission_error` | Auth — surface |
 | 400 | ClientError — surface |

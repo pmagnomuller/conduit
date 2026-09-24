@@ -39,6 +39,7 @@ func main() {
 	br := breaker.New(cfg.Paths.StatePath, cfg.FallbackOpenDuration(), cfg.Breaker.ProbeOnExpiry, func(format string, args ...any) {
 		log.Warn(fmt.Sprintf(format, args...))
 	})
+	br.SetFailoverProvider(cfg.Breaker.FailoverProvider)
 	cap := capture.New(cfg.Log.CapturePath, cfg.Log.CaptureUpstreamErrors)
 	met := metrics.New()
 	router := route.New(cfg.Jev, cfg.TypeSafeAPIKey, log)

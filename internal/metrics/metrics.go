@@ -83,7 +83,7 @@ func (c *Counters) Snapshot() Counters {
 
 type StatusResponse struct {
 	Listen   string            `json:"listen"`
-	Routing  string            `json:"routing"` // anthropic | glm | probe
+	Routing  string            `json:"routing"` // anthropic | glm | deepseek | probe
 	Breaker  breaker.Snapshot  `json:"breaker"`
 	Counts   Counters          `json:"counts"`
 	Upstream map[string]string `json:"upstream"`
@@ -93,6 +93,8 @@ type StatusResponse struct {
 	// Forced routing state set via /_gateway/route ("" = automatic).
 	ForcedProvider string `json:"forced_provider,omitempty"`
 	ForcedModel    string `json:"forced_model,omitempty"`
+	// Effective failover tier when the Anthropic breaker opens (glm|deepseek).
+	FailoverProvider string `json:"failover_provider,omitempty"`
 	// Routing mode (auto|pinned|jev) and whether the Jev router is usable.
 	Mode       string `json:"mode"`
 	JevEnabled bool   `json:"jev_enabled"`

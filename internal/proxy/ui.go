@@ -358,8 +358,9 @@ function render(s, r) {
       b.title = jev.enabled ? 'ask Jev per request' : 'set TYPESAFE_API_KEY in ~/.config/conduit/.env';
     }
   });
+  var fop = s.failover_provider || 'glm';
   $('modeHelp').textContent = {
-    auto: 'anthropic; breaker open → glm → deepseek',
+    auto: 'anthropic; breaker open → ' + fop,
     pinned: fp ? 'all traffic → ' + fp + (fm ? ' / ' + fm : '') : 'pick a provider below',
     jev: 'per request: Jev picks provider+model; breaker still wins; fail-open → auto'
   }[showPin && mode !== 'pinned' ? 'pinned' : mode];

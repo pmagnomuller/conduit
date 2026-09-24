@@ -39,6 +39,10 @@ type fakeUpstreams struct {
 	deepseek  http.HandlerFunc
 
 	enableDeepSeek bool
+	// failoverProvider overrides cfg.Breaker.FailoverProvider ("" = default glm).
+	failoverProvider string
+	// treatHeaderless429 sets cfg.Breaker.TreatHeaderless429AsQuota (false default).
+	treatHeaderless429 bool
 	// decider, when set, is injected as the jev router (nil = jev disabled).
 	decider proxy.Decider
 
@@ -115,6 +119,12 @@ func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Brea
 		cfg.DeepSeek.BaseURL = deepseek.URL
 		cfg.DeepSeek.DefaultModel = "deepseek-v4-flash"
 		cfg.DeepSeekAPIKey = "deepseek-test-key-secret"
+	}
+	if f.failoverProvider != "" {
+		cfg.Breaker.FailoverProvider = f.failoverProvider
+	}
+	if f.treatHeaderless429 {
+		cfg.Breaker.TreatHeaderless429AsQuota = true
 	}
 	cfg.Paths.StatePath = statePath
 	cfg.Log.CapturePath = capturePath
@@ -567,7 +577,7 @@ func TestGLMHardDownFailsOverToDeepSeek(t *testing.T) {
 	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
 		t.Fatal(err)
 	}
-	if m["model"] != "deepseek-v4-flash" {
+	if m["model"] != "deepseek-v4-pro" {
 		t.Fatalf("model rewrite=%v", m["model"])
 	}
 	if !strings.HasPrefix(f.deepSeekAuth[0], "Bearer deepseek-test-key") {
@@ -580,6 +590,121 @@ func TestGLMHardDownFailsOverToDeepSeek(t *testing.T) {
 	assertNoSecretOnDisk(t, dir, fakeToken)
 	assertNoSecretOnDisk(t, dir, "zai-test-key-secret")
 	assertNoSecretOnDisk(t, dir, "deepseek-test-key-secret")
+}
+
+func TestPreStream429FailsOverToDeepSeekWhenConfigured(t *testing.T) {
+	f := &fakeUpstreams{enableDeepSeek: true, failoverProvider: "deepseek"}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Reset", "9999999999")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("glm must not be called when failover provider is deepseek")
+	}
+	f.deepseek = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"text","text":"ds"}]}`))
+	}
+
+	srv, br, dir := newGateway(t, f)
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`)
+	res := post(t, srv.URL+"/v1/messages", reqBody, fakeToken)
+	defer res.Body.Close()
+	got, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 || !bytes.Contains(got, []byte("Switched to DeepSeek")) {
+		t.Fatalf("status=%d body=%s", res.StatusCode, got)
+	}
+	if res.Header.Get("X-Conduit-Provider") != "deepseek" {
+		t.Fatalf("provider header=%q", res.Header.Get("X-Conduit-Provider"))
+	}
+	if f.glmHits.Load() != 0 {
+		t.Fatalf("glm hits=%d", f.glmHits.Load())
+	}
+	if f.deepSeekHits.Load() != 1 {
+		t.Fatalf("deepseek hits=%d", f.deepSeekHits.Load())
+	}
+	if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Open {
+		t.Fatalf("breaker=%s", st)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var m map[string]any
+	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "deepseek-v4-pro" {
+		t.Fatalf("model rewrite=%v, want deepseek-v4-pro", m["model"])
+	}
+	assertNoSecretOnDisk(t, dir, fakeToken)
+	assertNoSecretOnDisk(t, dir, "zai-test-key-secret")
+	assertNoSecretOnDisk(t, dir, "deepseek-test-key-secret")
+}
+
+func TestHeaderless429FailsOverWhenOptIn(t *testing.T) {
+	f := &fakeUpstreams{enableDeepSeek: true, failoverProvider: "deepseek", treatHeaderless429: true}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) { t.Fatal("glm must not be called") }
+	f.deepseek = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"text","text":"ds"}]}`))
+	}
+
+	srv, br, _ := newGateway(t, f)
+	res := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res.Body.Close()
+	got, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 || res.Header.Get("X-Conduit-Provider") != "deepseek" {
+		t.Fatalf("status=%d provider=%q body=%s", res.StatusCode, res.Header.Get("X-Conduit-Provider"), got)
+	}
+	if f.deepSeekHits.Load() != 1 {
+		t.Fatalf("deepseek hits=%d", f.deepSeekHits.Load())
+	}
+	if f.glmHits.Load() != 0 {
+		t.Fatalf("glm hits=%d", f.glmHits.Load())
+	}
+	if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Open {
+		t.Fatalf("breaker=%s, want OPEN", st)
+	}
+}
+
+func TestHeaderless429StaysTransientByDefault(t *testing.T) {
+	f := &fakeUpstreams{enableDeepSeek: true, failoverProvider: "deepseek"}
+	var n atomic.Int32
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) { t.Fatal("glm must not be called") }
+	f.deepseek = func(w http.ResponseWriter, r *http.Request) { t.Fatal("deepseek must not be called without opt-in") }
+
+	srv, br, _ := newGateway(t, f)
+	res := post(t, srv.URL+"/v1/messages", []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`), fakeToken)
+	defer res.Body.Close()
+	if res.StatusCode != 429 {
+		t.Fatalf("status=%d, want 429 surfaced after transient retries", res.StatusCode)
+	}
+	if f.anthropicHits.Load() != 3 {
+		t.Fatalf("anthropic hits=%d, want 3 (1 + 2 transient retries)", f.anthropicHits.Load())
+	}
+	if f.deepSeekHits.Load() != 0 {
+		t.Fatalf("deepseek hits=%d", f.deepSeekHits.Load())
+	}
+	if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Closed {
+		t.Fatalf("breaker=%s, want CLOSED", st)
+	}
 }
 
 func TestDeepSeekStripsArtifactTool(t *testing.T) {
@@ -618,8 +743,8 @@ func TestDeepSeekStripsArtifactTool(t *testing.T) {
 	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Model != "deepseek-v4-flash" {
-		t.Fatalf("model=%q, want deepseek-v4-flash", m.Model)
+	if m.Model != "deepseek-v4-pro" {
+		t.Fatalf("model=%q, want deepseek-v4-pro", m.Model)
 	}
 	var names []string
 	for _, tl := range m.Tools {

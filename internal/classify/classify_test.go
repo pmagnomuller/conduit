@@ -12,12 +12,13 @@ import (
 
 func TestClassifyTable(t *testing.T) {
 	cases := []struct {
-		name   string
-		status int
-		hdr    http.Header
-		body   string
-		want   classify.Kind
-		reason string // substring
+		name            string
+		status          int
+		hdr             http.Header
+		body            string
+		treatHeaderless bool
+		want            classify.Kind
+		reason          string // substring
 	}{
 		{
 			name:   "429 quota with unified headers",
@@ -46,6 +47,24 @@ func TestClassifyTable(t *testing.T) {
 			body:   `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}`,
 			want:   classify.Transient,
 			reason: "no_unified",
+		},
+		{
+			name:            "429 rate_limit_error no unified headers treated quota when opt-in",
+			status:          429,
+			hdr:             http.Header{},
+			body:            `{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`,
+			treatHeaderless: true,
+			want:            classify.Quota,
+			reason:          "no_unified_headers_as_quota",
+		},
+		{
+			name:            "429 capacity throttle stays transient even with opt-in",
+			status:          429,
+			hdr:             http.Header{"X-Should-Retry": []string{"true"}},
+			body:            `{"type":"error","error":{"type":"rate_limit_error","message":"Server is temporarily limiting requests (not your usage limit)"}}`,
+			treatHeaderless: true,
+			want:            classify.Transient,
+			reason:          "capacity_throttle",
 		},
 		{
 			name:   "403 billing_error",
@@ -123,7 +142,7 @@ func TestClassifyTable(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classify.ClassifyAnthropic(tc.status, tc.hdr, []byte(tc.body))
+			got := classify.ClassifyAnthropic(tc.status, tc.hdr, []byte(tc.body), tc.treatHeaderless)
 			if got.Kind != tc.want {
 				t.Fatalf("kind=%v want=%v reason=%s", got.Kind, tc.want, got.Reason)
 			}

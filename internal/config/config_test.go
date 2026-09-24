@@ -73,8 +73,12 @@ func TestLoadOK(t *testing.T) {
 func TestMapModelDeepSeekDefault(t *testing.T) {
 	cfg := config.Default()
 	m, ok := cfg.MapModelDeepSeek("claude-opus-5")
+	if !ok || m != "deepseek-v4-pro" {
+		t.Fatalf("got %q ok=%v, want deepseek-v4-pro", m, ok)
+	}
+	m, ok = cfg.MapModelDeepSeek("totally-unknown-model")
 	if !ok || m != "deepseek-v4-flash" {
-		t.Fatalf("got %q ok=%v", m, ok)
+		t.Fatalf("default fallback got %q ok=%v, want deepseek-v4-flash", m, ok)
 	}
 }
 
@@ -89,6 +93,37 @@ func TestMapModelLongestPrefixDeterministic(t *testing.T) {
 		if !ok || m != "glm-5.3-flash" {
 			t.Fatalf("iter %d: got %q ok=%v, want glm-5.3-flash", i, m, ok)
 		}
+	}
+}
+
+func TestFailoverProviderDefaultAndValidation(t *testing.T) {
+	t.Setenv("ZAI_API_KEY", "k")
+	if got := config.Default().Breaker.FailoverProvider; got != "glm" {
+		t.Fatalf("default failover provider=%q, want glm", got)
+	}
+	cfg, err := config.Load(writeCfg(t, "listen = \"127.0.0.1:8787\"\n[breaker]\nfailover_provider = \"deepseek\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Breaker.FailoverProvider != "deepseek" {
+		t.Fatalf("failover provider=%q, want deepseek", cfg.Breaker.FailoverProvider)
+	}
+	if _, err := config.Load(writeCfg(t, "listen = \"127.0.0.1:8787\"\n[breaker]\nfailover_provider = \"openai\"\n")); err == nil {
+		t.Fatal("expected error for invalid failover_provider")
+	}
+}
+
+func TestTreatHeaderless429AsQuota(t *testing.T) {
+	t.Setenv("ZAI_API_KEY", "k")
+	if config.Default().Breaker.TreatHeaderless429AsQuota {
+		t.Fatal("default must be false")
+	}
+	cfg, err := config.Load(writeCfg(t, "listen = \"127.0.0.1:8787\"\n[breaker]\ntreat_headerless_429_as_quota = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Breaker.TreatHeaderless429AsQuota {
+		t.Fatal("treat_headerless_429_as_quota not loaded")
 	}
 }
 

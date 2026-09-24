@@ -17,8 +17,14 @@ Claude Code distinguishes **two different 429s**:
 
 | Kind | How to recognize | Gateway action |
 |---|---|---|
-| **Plan / usage quota** | `429` + `error.type == "rate_limit_error"` **and** `anthropic-ratelimit-unified-*` headers present (often `…-status: rejected\|exceeded\|rate_limited`, plus `…-5h-reset` / utilization). Often also `Retry-After`. | **OPEN breaker → GLM** |
+| **Plan / usage quota** | `429` + `error.type == "rate_limit_error"` **and** `anthropic-ratelimit-unified-*` headers present (often `…-status: rejected\|exceeded\|rate_limited`, plus `…-5h-reset` / utilization). Often also `Retry-After`. | **OPEN breaker → failover tier** (`failover_provider`, default `glm`). |
 | **Transient capacity throttle** | `429` + message containing `not your usage limit` / `temporarily limiting`, **or** a `rate_limit_error` **without** unified quota headers (Claude Code's own rule). Sometimes `x-should-retry: true`. | **Retry Anthropic. Do not fail over.** |
+
+**Opt-in `treat_headerless_429_as_quota`** (default `false`): flips a headerless
+`rate_limit_error` 429 from *Transient* to *Quota* for accounts whose plan-quota
+429s never carry unified headers. `not your usage limit` / `temporarily limiting`
+messages stay Transient regardless. Enable only when your account's quota signal
+is observably headerless — otherwise a bare-message capacity blip fails over too.
 
 Example quota-ish body seen in the wild (API / OAuth):
 
@@ -56,8 +62,9 @@ Other rows from the original design table are unchanged:
 | `400` | Surface |
 
 **Deviation from the naive “any 429 = quota” rule:** we **do not** treat every
-`rate_limit_error` as quota. Doing so would fail over to GLM during Anthropic
-capacity blips. Prefer unified headers / explicit “not your usage limit” text.
+`rate_limit_error` as quota. Doing so would fail over during Anthropic capacity
+blips. Prefer unified headers / explicit “not your usage limit” text. The
+`treat_headerless_429_as_quota` opt-in (above) is the deliberate exception.
 
 `proactive_threshold` / `proactive_utilization` default to disabled until you
 confirm header semantics on your account; enable once captures look trustworthy.

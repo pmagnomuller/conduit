@@ -299,20 +299,25 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	routing := g.breaker.RoutingProvider()
+	if fp := g.breaker.ForcedProvider(); fp != "" {
+		routing = fp
+	}
 	resp := metrics.StatusResponse{
 		Listen:  g.cfg.Listen,
-		Routing: g.breaker.RoutingProvider(),
+		Routing: routing,
 		Breaker: g.breaker.Snapshot(),
 		Counts:  g.metrics.Snapshot(),
 		Upstream: map[string]string{
 			"anthropic": g.cfg.Anthropic.BaseURL,
 			"glm":       g.cfg.GLM.BaseURL,
 		},
-		ForcedProvider: g.breaker.ForcedProvider(),
-		ForcedModel:    g.breaker.ForcedModel(),
-		Mode:           string(g.breaker.Mode()),
-		JevEnabled:     g.jevEnabled(),
-		LastRequest:    g.lastRequestSnapshot(),
+		ForcedProvider:   g.breaker.ForcedProvider(),
+		ForcedModel:      g.breaker.ForcedModel(),
+		Mode:             string(g.breaker.Mode()),
+		JevEnabled:       g.jevEnabled(),
+		FailoverProvider: g.failoverProvider(),
+		LastRequest:      g.lastRequestSnapshot(),
 	}
 	if g.cfg.DeepSeekAPIKey != "" {
 		resp.Upstream["deepseek"] = g.cfg.DeepSeek.BaseURL
@@ -436,7 +441,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	switch state {
 	case breaker.Open:
-		g.serveGLM(w, r, body, model, start, false, "")
+		g.serveFailover(w, r, body, model, start, false, "")
 		return
 	case breaker.Probe:
 		g.serveAnthropic(w, r, body, model, start, true, "")
@@ -528,7 +533,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 				g.cfg.Breaker.ProactiveUtilization,
 			); ok {
 				if g.breaker.Open(anthropicUpstream, upstreamModel, "proactive_"+reason, until, time.Now()) {
-					notify.FailoverToGLM(upstreamModel, g.glmModelFor(upstreamModel), "proactive_"+reason)
+					g.notifyFailover(upstreamModel, "proactive_"+reason)
 				}
 			}
 			if isProbe {
@@ -542,21 +547,21 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			return
 		}
 
-		class := classify.ClassifyAnthropic(resp.StatusCode, resp.Header, respBody)
+		class := classify.ClassifyAnthropic(resp.StatusCode, resp.Header, respBody, g.cfg.Breaker.TreatHeaderless429AsQuota)
 		_ = g.capture.Write(capture.FromResponse("anthropic", r.Method, r.URL.Path, upstreamModel, resp.StatusCode, resp.Header, respBody, class.Reason))
 
 		switch class.Kind {
 		case classify.Quota:
-			// The GLM tier and the notice are resolved from the model actually
-			// sent upstream, so the notice names the pair that will really
-			// serve this call. An override equal to "" keeps serveGLM's own
-			// mapping, which is what auto mode has always done.
+			// The failover tier and the notice are resolved from the model
+			// actually sent upstream, so the notice names the pair that will
+			// really serve this call. An override equal to "" keeps the tier's
+			// own mapping, which is what auto mode has always done.
 			failoverOverride := ""
 			if upstreamModel != model {
-				failoverOverride = g.glmModelFor(upstreamModel)
+				failoverOverride = g.failoverModelFor(upstreamModel)
 			}
 			if g.breaker.Open(anthropicUpstream, upstreamModel, class.Reason, class.Until, time.Now()) {
-				notify.FailoverToGLM(upstreamModel, g.glmModelFor(upstreamModel), class.Reason)
+				g.notifyFailover(upstreamModel, class.Reason)
 			}
 			_ = resp.Body.Close()
 			// Pre-stream (or non-stream) failover: client has not seen bytes yet
@@ -565,7 +570,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			// quota errors rather than fail over.
 			if !peeked && g.breaker.ForcedProvider() != "anthropic" {
 				g.metrics.IncFailover()
-				g.serveGLM(w, r, body, model, start, true, failoverOverride)
+				g.serveFailover(w, r, body, model, start, true, failoverOverride)
 				return
 			}
 			// Mid-stream: already copied error? Shouldn't happen — we only peek
@@ -676,6 +681,48 @@ func (g *Gateway) glmModelFor(model string) string {
 		return m
 	}
 	return model
+}
+
+// failoverProvider reports the tier the gateway fails over to when the breaker
+// opens. DeepSeek only counts when its key is present; a configured-but-keyless
+// DeepSeek tier degrades to GLM so a failover never 502s on a missing key.
+func (g *Gateway) failoverProvider() string {
+	if g.cfg.Breaker.FailoverProvider == "deepseek" && g.cfg.DeepSeekAPIKey != "" {
+		return "deepseek"
+	}
+	return "glm"
+}
+
+// failoverModelFor resolves the failover tier's upstream model for an Anthropic
+// model id, honoring the configured failover provider.
+func (g *Gateway) failoverModelFor(anthropicModel string) string {
+	if g.failoverProvider() == "deepseek" {
+		if m, ok := g.cfg.MapModelDeepSeek(anthropicModel); ok {
+			return m
+		}
+		return anthropicModel
+	}
+	return g.glmModelFor(anthropicModel)
+}
+
+// notifyFailover fires the failover notification for the configured tier.
+func (g *Gateway) notifyFailover(model, reason string) {
+	if g.failoverProvider() == "deepseek" {
+		notify.FailoverToDeepSeek(model, g.failoverModelFor(model), reason)
+		return
+	}
+	notify.FailoverToGLM(model, g.glmModelFor(model), reason)
+}
+
+// serveFailover routes the request to the configured failover tier after the
+// Anthropic breaker opens. modelOverride maps the inbound model when jev changed
+// it upstream; "" lets the tier's own model map apply.
+func (g *Gateway) serveFailover(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, modelOverride string) {
+	if g.failoverProvider() == "deepseek" {
+		g.serveDeepSeek(w, r, body, model, start, failover, "quota", modelOverride)
+		return
+	}
+	g.serveGLM(w, r, body, model, start, failover, modelOverride)
 }
 
 // shouldFallToDeepSeek reports whether a GLM failure is worth retrying on the

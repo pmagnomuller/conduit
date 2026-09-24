@@ -63,6 +63,16 @@ type BreakerConfig struct {
 	ProactiveThreshold   int     `toml:"proactive_threshold"`
 	ProactiveUtilization float64 `toml:"proactive_utilization"`
 	ProbeOnExpiry        bool    `toml:"probe_on_expiry"`
+	// FailoverProvider is the tier the gateway fails over to when the Anthropic
+	// breaker opens: "glm" (default) or "deepseek". DeepSeek is inert without
+	// DEEPSEEK_API_KEY; the proxy then degrades back to GLM.
+	FailoverProvider string `toml:"failover_provider"`
+	// TreatHeaderless429AsQuota flips a 429 rate_limit_error without unified
+	// rate-limit headers from Transient (retry, no failover) to Quota (open
+	// breaker). Opt-in for accounts whose plan-quota 429s never carry
+	// anthropic-ratelimit-unified-* headers. "not your usage limit" /
+	// "temporarily limiting" messages stay Transient regardless.
+	TreatHeaderless429AsQuota bool `toml:"treat_headerless_429_as_quota"`
 }
 
 type LogConfig struct {
@@ -150,13 +160,20 @@ func Default() Config {
 			BaseURL:      "https://api.deepseek.com/anthropic",
 			APIKeyEnv:    "DEEPSEEK_API_KEY",
 			DefaultModel: "deepseek-v4-flash",
-			ModelMap:     map[string]string{},
+			ModelMap: map[string]string{
+				"claude-fable-5-1": "deepseek-v4-pro",
+				"claude-opus-5-5":  "deepseek-v4-pro",
+				"claude-opus-5":    "deepseek-v4-pro",
+				"claude-sonnet-5":  "deepseek-v4-pro",
+				"claude-haiku-4-5": "deepseek-v4-flash",
+			},
 		},
 		Breaker: BreakerConfig{
 			FallbackOpenSeconds:  300,
 			ProactiveThreshold:   0,
 			ProactiveUtilization: 0,
 			ProbeOnExpiry:        true,
+			FailoverProvider:     "glm",
 		},
 		Log: LogConfig{
 			Level:                 "info",
@@ -280,6 +297,13 @@ func Load(path string) (Config, error) {
 	if cfg.Breaker.FallbackOpenSeconds <= 0 {
 		cfg.Breaker.FallbackOpenSeconds = 300
 	}
+	switch cfg.Breaker.FailoverProvider {
+	case "":
+		cfg.Breaker.FailoverProvider = "glm"
+	case "glm", "deepseek":
+	default:
+		return Config{}, fmt.Errorf("breaker.failover_provider must be glm or deepseek (got %q)", cfg.Breaker.FailoverProvider)
+	}
 	if !strings.HasPrefix(cfg.Listen, "127.0.0.1") && !strings.HasPrefix(cfg.Listen, "localhost") {
 		return Config{}, fmt.Errorf("listen must bind to loopback only (got %q)", cfg.Listen)
 	}
@@ -370,6 +394,12 @@ func applyEnv(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Breaker.ProactiveThreshold = n
 		}
+	}
+	if v := os.Getenv("CLAUDE_GLM_GATEWAY_FAILOVER_PROVIDER"); v != "" {
+		cfg.Breaker.FailoverProvider = v
+	}
+	if v := os.Getenv("CLAUDE_GLM_GATEWAY_TREAT_HEADERLESS_429_AS_QUOTA"); v != "" {
+		cfg.Breaker.TreatHeaderless429AsQuota = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v := os.Getenv("CLAUDE_GLM_GATEWAY_LOG_LEVEL"); v != "" {
 		cfg.Log.Level = v

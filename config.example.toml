@@ -32,8 +32,14 @@ base_url = "https://api.deepseek.com/anthropic"
 api_key_env = "DEEPSEEK_API_KEY"
 default_model = "deepseek-v4-flash"
 # Optional: claude-* → deepseek model overrides. Unmapped IDs use default_model.
-# [deepseek.model_map]
-# "claude-opus-5" = "deepseek-reasoner"
+# Frontier Claude tiers map to deepseek-v4-pro so a quota failover does not drop
+# to the cheapest tier; lighter tiers stay on v4-flash.
+[deepseek.model_map]
+"claude-fable-5-1" = "deepseek-v4-pro"
+"claude-opus-5-5" = "deepseek-v4-pro"
+"claude-opus-5" = "deepseek-v4-pro"
+"claude-sonnet-5" = "deepseek-v4-pro"
+"claude-haiku-4-5" = "deepseek-v4-flash"
 
 [breaker]
 fallback_open_seconds = 300
@@ -42,6 +48,15 @@ proactive_threshold = 0
 # Also open when anthropic-ratelimit-unified-*-utilization >= this (0 = disabled).
 proactive_utilization = 0.0
 probe_on_expiry = true
+# Primary failover tier when the Anthropic breaker opens: "glm" (default) or
+# "deepseek". DeepSeek requires DEEPSEEK_API_KEY; without it the gateway
+# degrades back to GLM.
+failover_provider = "glm"
+# Opt-in: flip a 429 rate_limit_error WITHOUT unified rate-limit headers from
+# transient (retry, no failover) to quota (open the breaker). Use if your
+# account's plan-quota 429s never carry anthropic-ratelimit-unified-* headers.
+# "not your usage limit" / "temporarily limiting" messages still stay transient.
+treat_headerless_429_as_quota = false
 
 [log]
 level = "info"

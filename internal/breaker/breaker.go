@@ -64,7 +64,11 @@ type Breaker struct {
 	path           string
 	fallback       time.Duration
 	probeOn        bool
-	log            Logger
+	// failoverProvider is the tier the gateway routes to while a model is OPEN
+	// (glm or deepseek). It only drives the Open log line and RoutingProvider;
+	// the proxy owns the actual routing decision.
+	failoverProvider string
+	log              Logger
 }
 
 func New(path string, fallbackOpen time.Duration, probeOnExpiry bool, log Logger) *Breaker {
@@ -72,12 +76,13 @@ func New(path string, fallbackOpen time.Duration, probeOnExpiry bool, log Logger
 		log = func(string, ...any) {}
 	}
 	b := &Breaker{
-		entries:  make(map[string]Entry),
-		mode:     route.ModeAuto,
-		path:     path,
-		fallback: fallbackOpen,
-		probeOn:  probeOnExpiry,
-		log:      log,
+		entries:          make(map[string]Entry),
+		mode:             route.ModeAuto,
+		path:             path,
+		fallback:         fallbackOpen,
+		probeOn:          probeOnExpiry,
+		failoverProvider: "glm",
+		log:              log,
 	}
 	_ = b.load()
 	return b
@@ -227,7 +232,7 @@ func (b *Breaker) Open(upstream, model, reason string, until time.Time, now time
 	_ = b.persistLocked()
 
 	retryAfter := until.Sub(now).Round(time.Second)
-	b.log("BREAKER OPEN %s -> glm (%s, retry-after=%s)", model, reason, retryAfter)
+	b.log("BREAKER OPEN %s -> %s (%s, retry-after=%s)", model, b.failoverProvider, reason, retryAfter)
 	return newly
 }
 
@@ -249,8 +254,8 @@ func (b *Breaker) ReOpenFromProbe(upstream, model, reason string, until time.Tim
 	return b.Open(upstream, model, reason, until, now)
 }
 
-// RoutingProvider returns a coarse hint for UIs: "glm" if any entry is OPEN,
-// "probe" if any is PROBE and none OPEN, otherwise "anthropic".
+// RoutingProvider returns a coarse hint for UIs: the failover provider if any
+// entry is OPEN, "probe" if any is PROBE and none OPEN, otherwise "anthropic".
 func (b *Breaker) RoutingProvider() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -258,7 +263,7 @@ func (b *Breaker) RoutingProvider() string {
 	for _, e := range b.entries {
 		switch e.State {
 		case Open:
-			return "glm"
+			return b.failoverProvider
 		case Probe:
 			probe = true
 		}
@@ -331,6 +336,18 @@ func (b *Breaker) SetMode(m route.Mode) {
 }
 
 func (b *Breaker) ClearForce() { b.SetForce("", "") }
+
+// SetFailoverProvider names the tier the gateway routes to while a model is
+// OPEN. It only affects the Open log line and RoutingProvider; the proxy makes
+// the actual routing decision. "" is normalized to "glm".
+func (b *Breaker) SetFailoverProvider(p string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if p == "" {
+		p = "glm"
+	}
+	b.failoverProvider = p
+}
 
 func (b *Breaker) ForcedProvider() string {
 	b.mu.Lock()

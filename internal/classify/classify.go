@@ -57,8 +57,10 @@ type anthropicErrorBody struct {
 // Subscription finding (see FINDINGS.md): Claude Code distinguishes real plan
 // quota 429s from transient capacity throttles by the presence of
 // anthropic-ratelimit-unified-* headers. Throttles that say "not your usage
-// limit" / lack unified headers must NOT open the breaker.
-func ClassifyAnthropic(status int, hdr http.Header, body []byte) Result {
+// limit" / lack unified headers must NOT open the breaker. treatHeaderless429AsQuota
+// is the opt-in escape hatch for accounts whose plan-quota 429s never carry
+// unified headers: it flips a bare rate_limit_error to Quota.
+func ClassifyAnthropic(status int, hdr http.Header, body []byte, treatHeaderless429AsQuota bool) Result {
 	if status >= 200 && status < 300 {
 		return Result{Kind: OK, Reason: "2xx"}
 	}
@@ -86,7 +88,7 @@ func ClassifyAnthropic(status int, hdr http.Header, body []byte) Result {
 			return Result{Kind: Auth, Reason: "403_" + errType}
 		}
 	case 429:
-		return classify429(hdr, errType, msg)
+		return classify429(hdr, errType, msg, treatHeaderless429AsQuota)
 	case 500, 502, 503, 529:
 		reason := strconv.Itoa(status)
 		if errType != "" {
@@ -101,8 +103,9 @@ func ClassifyAnthropic(status int, hdr http.Header, body []byte) Result {
 	}
 }
 
-func classify429(hdr http.Header, errType, msg string) Result {
-	// Explicit capacity throttle (Claude Code docs).
+func classify429(hdr http.Header, errType, msg string, treatHeaderlessAsQuota bool) Result {
+	// Explicit capacity throttle (Claude Code docs): "not your usage limit" is
+	// by definition not a plan-quota signal and must never fail over.
 	if strings.Contains(msg, "not your usage limit") ||
 		strings.Contains(msg, "temporarily limiting") {
 		return Result{Kind: Transient, Reason: "capacity_throttle"}
@@ -120,8 +123,14 @@ func classify429(hdr http.Header, errType, msg string) Result {
 		return Result{Kind: Quota, Reason: reason, Until: until}
 	}
 
-	// No unified headers: treat as transient capacity throttle (Claude Code
-	// distinguishing rule), even when error.type is rate_limit_error.
+	// No unified headers. Default: transient capacity throttle (Claude Code
+	// distinguishing rule), even when error.type is rate_limit_error. The
+	// opt-in flag flips a bare rate_limit_error to Quota for accounts whose
+	// plan-quota 429s never carry unified headers.
+	if treatHeaderlessAsQuota && (errType == "rate_limit_error" || errType == "") {
+		return Result{Kind: Quota, Reason: "429_no_unified_headers_as_quota", Until: until}
+	}
+
 	if errType == "rate_limit_error" || errType == "" {
 		return Result{Kind: Transient, Reason: "429_no_unified_headers"}
 	}
