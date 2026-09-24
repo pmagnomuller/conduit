@@ -23,6 +23,8 @@ type decision struct {
 	Source         string    `json:"source"`
 	Reason         string    `json:"reason,omitempty"`
 	Confidence     float64   `json:"confidence,omitempty"`
+	Margin         float64   `json:"margin,omitempty"`
+	Pick           string    `json:"pick,omitempty"`
 	LatencyMS      int64     `json:"latency_ms"`
 }
 
@@ -121,6 +123,12 @@ func formatDecision(d decision) string {
 		d.At.Local().Format("2006-01-02 15:04:05"), d.RequestedModel, chosen, d.Step, d.Lease, d.Source)
 	if d.Confidence > 0 {
 		line += fmt.Sprintf(" conf=%.2f", d.Confidence)
+	}
+	if d.Margin > 0 {
+		line += fmt.Sprintf(" margin=%.2f", d.Margin)
+	}
+	if d.Pick != "" {
+		line += " pick=" + d.Pick
 	}
 	line += fmt.Sprintf(" %dms", d.LatencyMS)
 	if d.Reason != "" {

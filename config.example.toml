@@ -85,6 +85,15 @@ timeout_ms = 4000
 lease_ttl_seconds = 600
 # Append-only log of every routing decision. Empty string disables.
 decisions_path = "~/.local/state/conduit/decisions.jsonl"
+# Switch cost: a switch away from the thread's current model makes the new
+# model reprocess the whole context. Above this estimated size (tokens) a
+# switch needs switch_confidence, else the thread stays (source "sticky").
+# Negative disables.
+max_switch_context = 60000
+switch_confidence = 0.8
+# Minimum p(top)-p(second) from Jev before its pick is honoured; below it the
+# thread stays on its current model (source "low_confidence"). Negative disables.
+min_margin = 0.15
 
 # Candidate catalog. Omit to use the built-in default (opus/sonnet/haiku,
 # glm-5.3, glm-5.3-flash, deepseek-v4-flash). Defining any entry replaces

@@ -95,7 +95,7 @@ breaker is OPEN and minus `deepseek/*` when no key is set. The router then
 either reuses a lease, asks Jev, or fails open (§4). A successful decision is
 served on the chosen provider with `model` rewritten to the pick — including
 on the Anthropic path when Jev chose a different Claude model. The response
-carries `X-Conduit-Decision: jev|lease|fail_open`.
+carries `X-Conduit-Decision: jev|lease|sticky|low_confidence|fail_open`.
 
 ### 2.5 The provider functions
 
@@ -195,6 +195,8 @@ client input is clipped, rune-safe, before it goes anywhere:
 | `intent_tail` | last assistant text (tool steps only) | 400 chars |
 | `requested_model` | `model` | 128 chars |
 | `thinking_budget`, `n_messages`, `n_tools`, `has_image` | body | — |
+| `context_tokens_est` | body bytes / 4 — the rebuild cost of a switch | — |
+| `current`, `cache_warm` | router: catalog key that served this thread last; served < 5 min ago | — |
 
 The system prompt and tool schemas are never included.
 
@@ -224,19 +226,39 @@ Leases expire after `lease_ttl_seconds` (600), are dropped if the leased
 candidate is no longer in the filtered list, and the map is capped at 1000
 entries. A reused decision is recorded with `source: lease`.
 
-### 4.4 Fail-open
+### 4.4 Switch policy
+
+Every switch between models is a cold prefix: no prompt cache is shared across
+providers or across Claude models, and conduit forwards the full transcript,
+so the new model reprocesses all of it (and switching back pays again). See
+[docs/jev-engineering.md](docs/jev-engineering.md). The router tracks the
+current model per fingerprint (kept across `one_call`, same TTL and cap as
+leases), tells Jev via `current` / `cache_warm` / `context_tokens_est`, and
+enforces two deterministic guards on a switch away from `current`:
+
+| source | when | effect |
+|---|---|---|
+| `low_confidence` | Jev's `p(top) − p(second)` < `min_margin` (0.15); skipped if no probabilities | stay on `current` |
+| `sticky` | `context_tokens_est` > `max_switch_context` (60000) and confidence < `switch_confidence` (0.8) | stay on `current` |
+
+An override records Jev's answer in `pick`, is never leased, and only ever
+stays — the router never invents a third choice. A `current` no longer in
+the filtered candidates (breaker OPEN) is not reported and cannot be stayed
+on. Negative thresholds disable either guard.
+
+### 4.5 Fail-open
 
 `Decide` never blocks past the timeout, never panics (a `recover` converts a
 panic into a fail-open), and never surfaces an error to the client. Any
 failure yields `ok=false`; the proxy then serves the request exactly as
 `auto` would. The reason (redacted) is recorded.
 
-### 4.5 Records
+### 4.6 Records
 
 Every decision — including fail-open — goes to an in-memory ring (200, shown as
 `jev.recent` in the UI) and is appended to `decisions.jsonl` (mode 0600,
 rotated at 4 MiB to `decisions.jsonl.1`). Fields are the already-clipped
-dossier values plus provider, model, lease, source, confidence, latency.
+dossier values plus provider, model, lease, source, confidence, margin, pick, latency.
 
 ---
 

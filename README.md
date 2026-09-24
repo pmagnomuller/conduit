@@ -115,6 +115,13 @@ can only choose GLM/DeepSeek. DeepSeek entries are removed when
 `tool_chain`, `user_turn`); follow-up tool steps in the same conversation
 reuse the decision (`source: lease`) instead of asking again.
 
+**Switch cost.** Switching models mid-conversation makes the new model
+reprocess the whole context with a cold cache. Jev is told the thread's
+current model and context size; on a large context a low-confidence switch
+stays put (`source: sticky`), and a near-tie between Jev's top two picks stays
+put too (`source: low_confidence`). Tune with `max_switch_context`,
+`switch_confidence`, `min_margin` in `[jev]`.
+
 **Half-open probes bypass Jev.** When an Anthropic entry's open window has
 expired, that one call goes to Anthropic with the model you asked for (so the
 breaker can decide whether to close) rather than to Jev's pick — the same probe
@@ -126,7 +133,7 @@ routing pays for parsing your body twice, so the cap applies in every mode.
 
 Every decision (including fail-open) is appended to
 `~/.local/state/conduit/decisions.jsonl` and exposed as `jev.recent` on
-`GET /_gateway/route`; proxied responses carry `X-Conduit-Decision: jev|lease|fail_open`.
+`GET /_gateway/route`; proxied responses carry `X-Conduit-Decision: jev|lease|sticky|low_confidence|fail_open`.
 
 The log rotates at 4 MiB (one previous file, `decisions.jsonl.1`) and only ever
 records clipped fields: the prompt excerpt, tool names and the requested model

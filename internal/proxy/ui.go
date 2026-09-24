@@ -159,6 +159,7 @@ const uiHTML = `<!doctype html>
          letter-spacing: .04em; border: 1px solid; white-space: nowrap; }
   .src.jev { color: var(--info); border-color: var(--info); }
   .src.lease { color: var(--muted); border-color: var(--line2); border-style: dashed; }
+  .src.stay { color: var(--muted); border-color: var(--line2); }
   .src.fail_open { color: var(--warn); border-color: var(--warn); background: rgba(252,196,25,.1); }
   .bar { position: relative; height: 8px; background: var(--card2); border: 1px solid var(--line);
          border-radius: 4px; overflow: hidden; }
@@ -438,11 +439,13 @@ function renderJev(jev) {
   }
   rows.innerHTML = recent.map(function (d) {
     var src = d.source || 'jev';
-    var srcCls = src === 'lease' ? 'lease' : src === 'fail_open' ? 'fail_open' : 'jev';
+    var srcCls = src === 'lease' ? 'lease' : src === 'fail_open' ? 'fail_open' :
+      (src === 'sticky' || src === 'low_confidence') ? 'stay' : 'jev';
     var conf = typeof d.confidence === 'number' ? Math.max(0, Math.min(1, d.confidence)) : 0;
     var pct = Math.round(conf * 100);
     var lat = typeof d.latency_ms === 'number' ? d.latency_ms + 'ms' : '—';
-    var reason = d.reason ? ' title="' + esc(d.reason) + '"' : '';
+    var why = d.reason || (d.pick ? 'Jev picked ' + d.pick : '');
+    var reason = why ? ' title="' + esc(why) + '"' : '';
     return '<div class="dec">' +
       '<span class="t">' + fmtTime(d.at) + '</span>' +
       '<span class="rt"><span class="req" title="' + esc(d.requested_model) + '">' + esc(d.requested_model || '?') +

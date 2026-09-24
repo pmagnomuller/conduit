@@ -25,16 +25,29 @@ type Decision struct {
 	Model          string    `json:"model"`
 	Step           string    `json:"step"`             // user_turn|tool_step|other
 	Lease          string    `json:"lease"`            // one_call|tool_chain|user_turn
-	Source         string    `json:"source"`           // "jev" | "lease" (reused) | "fail_open"
+	Source         string    `json:"source"`           // jev|lease|sticky|low_confidence|fail_open
 	Reason         string    `json:"reason,omitempty"` // error text on fail_open, redacted
 	Confidence     float64   `json:"confidence,omitempty"`
-	LatencyMS      int64     `json:"latency_ms"`
+	Margin         float64   `json:"margin,omitempty"` // Jev's p(top)−p(second), when given
+	// Pick is Jev's choice when the router overrode it (sticky, low_confidence).
+	Pick      string `json:"pick,omitempty"`
+	LatencyMS int64  `json:"latency_ms"`
 }
 
 const (
 	SourceJev      = "jev"
 	SourceLease    = "lease"
 	SourceFailOpen = "fail_open"
+	// SourceSticky: Jev wanted a switch on a large context without enough
+	// confidence to pay the rebuild, so the thread stayed on its model.
+	SourceSticky = "sticky"
+	// SourceLowConfidence: Jev's top two picks were too close to call, so the
+	// thread stayed on its model.
+	SourceLowConfidence = "low_confidence"
+
+	// cacheWarmWindow approximates the provider prompt-cache TTL (Anthropic's
+	// default is five minutes); a thread served within it is cache-warm.
+	cacheWarmWindow = 5 * time.Minute
 
 	recentCap = 200
 	// leaseCap bounds the lease map; conversations that never end their
@@ -46,6 +59,12 @@ const (
 // const, so tests can exercise rotation without writing megabytes. Worst case
 // on disk is two files of about this size.
 var decisionsMaxBytes int64 = 4 << 20
+
+// served is the last catalog key a thread was routed to.
+type served struct {
+	key string
+	at  time.Time
+}
 
 type lease struct {
 	decision Decision
@@ -61,13 +80,20 @@ type Router struct {
 	client  *client
 	timeout time.Duration
 	ttl     time.Duration
-	log     *slog.Logger
-	now     func() time.Time // injectable for lease tests
+	// switch-cost policy, defaults applied; ≤0 disables the check.
+	maxSwitch  int
+	switchConf float64
+	minMargin  float64
+	log        *slog.Logger
+	now        func() time.Time // injectable for lease tests
 
 	mu     sync.Mutex
 	leases map[string]lease
-	recent []Decision // newest last; Recent reverses
-	fileMu sync.Mutex
+	// history is the current model per conversation, kept across one_call
+	// decisions (unlike leases) so Jev can be told what a switch costs.
+	history map[string]served
+	recent  []Decision // newest last; Recent reverses
+	fileMu  sync.Mutex
 	// decisions log bookkeeping, guarded by fileMu; logBytes is the current
 	// append offset, so rotation needs no stat per decision.
 	logPath  string
@@ -89,13 +115,17 @@ func New(cfg config.JevConfig, apiKey string, log *slog.Logger) *Router {
 		ttl = 10 * time.Minute
 	}
 	r := &Router{
-		cfg:     cfg,
-		enabled: apiKey != "",
-		timeout: timeout,
-		ttl:     ttl,
-		log:     log,
-		now:     time.Now,
-		leases:  map[string]lease{},
+		cfg:        cfg,
+		enabled:    apiKey != "",
+		timeout:    timeout,
+		ttl:        ttl,
+		maxSwitch:  orDefault(cfg.MaxSwitchContext, config.DefaultMaxSwitchContext),
+		switchConf: orDefault(cfg.SwitchConfidence, config.DefaultSwitchConfidence),
+		minMargin:  orDefault(cfg.MinMargin, config.DefaultMinMargin),
+		log:        log,
+		now:        time.Now,
+		leases:     map[string]lease{},
+		history:    map[string]served{},
 	}
 	if r.enabled {
 		r.client = &client{
@@ -106,6 +136,14 @@ func New(cfg config.JevConfig, apiKey string, log *slog.Logger) *Router {
 		}
 	}
 	return r
+}
+
+// orDefault maps the zero value to def; negative stays negative (disabled).
+func orDefault[T int | float64](v, def T) T {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 func (r *Router) Enabled() bool { return r.enabled }
@@ -136,13 +174,17 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		return r.failOpen(start, dossier, "no candidates"), false
 	}
 
+	r.fillCurrent(&dossier, candidates, start)
+
 	if ld, reused := r.reuseLease(dossier, candidates, start); reused {
 		ld.At = start
 		ld.Source = SourceLease
 		ld.Step = dossier.Step
 		ld.RequestedModel = dossier.RequestedModel
 		ld.Reason = ""
+		ld.Pick, ld.Margin = "", 0
 		ld.LatencyMS = r.now().Sub(start).Milliseconds()
+		r.remember(dossier, ld, start)
 		r.record(ld)
 		return ld, true
 	}
@@ -157,7 +199,8 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 	if err != nil {
 		return r.failOpen(start, dossier, err.Error()), false
 	}
-	provider, model := splitKey(res.Choice)
+	choice, source := r.applySwitchPolicy(dossier, res)
+	provider, model := splitKey(choice)
 	d = Decision{
 		At:             start,
 		RequestedModel: dossier.RequestedModel,
@@ -165,13 +208,77 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		Model:          model,
 		Step:           dossier.Step,
 		Lease:          res.Lease,
-		Source:         SourceJev,
+		Source:         source,
 		Confidence:     res.Confidence,
+		Margin:         res.Margin,
 		LatencyMS:      r.now().Sub(start).Milliseconds(),
 	}
+	if source != SourceJev {
+		// An override is a one-off: leasing it would pin the thread against
+		// Jev's actual answer.
+		d.Pick = res.Choice
+		d.Lease = LeaseOneCall
+	}
 	r.storeLease(dossier, d, start)
+	r.remember(dossier, d, start)
 	r.record(d)
 	return d, true
+}
+
+// applySwitchPolicy decides whether Jev's pick is worth a context rebuild.
+// Only a switch away from a known current model can be overridden, and the
+// override is always to stay: the router never invents a third choice.
+func (r *Router) applySwitchPolicy(d Dossier, res jevResult) (string, string) {
+	if d.Current == "" || res.Choice == d.Current {
+		return res.Choice, SourceJev
+	}
+	if r.minMargin > 0 && res.HasMargin && res.Margin < r.minMargin {
+		return d.Current, SourceLowConfidence
+	}
+	if r.maxSwitch > 0 && d.ContextTokensEst > r.maxSwitch && res.Confidence < r.switchConf {
+		return d.Current, SourceSticky
+	}
+	return res.Choice, SourceJev
+}
+
+// fillCurrent tells the dossier which candidate served the thread last and
+// whether its cache is plausibly warm. A current model no longer offered
+// (breaker OPEN, key removed) is not a place to stay, so it is left out.
+func (r *Router) fillCurrent(d *Dossier, cands []Candidate, now time.Time) {
+	r.mu.Lock()
+	h, ok := r.history[d.fingerprint]
+	r.mu.Unlock()
+	if !ok || now.Sub(h.at) >= r.ttl {
+		return
+	}
+	if !slices.ContainsFunc(cands, func(c Candidate) bool { return c.Key() == h.key }) {
+		return
+	}
+	d.Current = h.key
+	d.CacheWarm = now.Sub(h.at) < cacheWarmWindow
+}
+
+// remember records the routed model for the thread. It reflects the routing
+// decision, not a later upstream failover.
+func (r *Router) remember(d Dossier, dec Decision, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.history) >= leaseCap {
+		for k, h := range r.history {
+			if now.Sub(h.at) >= r.ttl {
+				delete(r.history, k)
+			}
+		}
+		if len(r.history) >= leaseCap {
+			for k := range r.history {
+				delete(r.history, k)
+				if len(r.history) < leaseCap/2 {
+					break
+				}
+			}
+		}
+	}
+	r.history[d.fingerprint] = served{key: dec.Provider + "/" + dec.Model, at: now}
 }
 
 func splitKey(key string) (provider, model string) {

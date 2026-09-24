@@ -48,6 +48,14 @@ type Dossier struct {
 	NMessages      int        `json:"n_messages"`
 	HasImage       bool       `json:"has_image"`
 	NTools         int        `json:"n_tools"`
+	// ContextTokensEst is a rough size of what any model serving this call
+	// must process (body bytes / 4): the rebuild cost of a switch.
+	ContextTokensEst int `json:"context_tokens_est"`
+	// Current is the catalog key that served this thread's previous call, and
+	// CacheWarm whether that was recent enough for its prompt cache to hold.
+	// Filled by the router, not by Extract.
+	Current   string `json:"current,omitempty"`
+	CacheWarm bool   `json:"cache_warm,omitempty"`
 
 	// fingerprint is the lease key; not sent to Jev.
 	fingerprint string
@@ -239,6 +247,9 @@ func Extract(body []byte) Dossier {
 		RequestedModel: clipHead(in.Model, modelClip),
 		NMessages:      len(in.Messages),
 		NTools:         len(in.Tools),
+		// ~4 bytes per token; JSON framing inflates it slightly, which only
+		// errs toward treating a switch as costlier.
+		ContextTokensEst: len(body) / 4,
 	}
 	if in.Thinking != nil {
 		d.ThinkingBudget = in.Thinking.BudgetTokens

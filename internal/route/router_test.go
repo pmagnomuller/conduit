@@ -31,6 +31,8 @@ type jevStub struct {
 	status  int
 	errBody string // overrides the canned error body when set
 	delay   time.Duration
+	conf    float64            // model confidence; 0 → 0.83
+	probs   map[string]float64 // model probabilities; nil → none
 	calls   atomic.Int32
 	last    atomic.Pointer[jevRequest]
 	gotKey  atomic.Pointer[string]
@@ -61,8 +63,12 @@ func (s *jevStub) handler() http.Handler {
 			_, _ = w.Write([]byte(body))
 			return
 		}
+		conf := s.conf
+		if conf == 0 {
+			conf = 0.83
+		}
 		_ = json.NewEncoder(w).Encode(jevResponse{Answers: map[string]jevAnswer{
-			"model": {Choice: s.choice, Confidence: 0.83},
+			"model": {Choice: s.choice, Confidence: conf, Probabilities: s.probs},
 			"lease": {Choice: s.lease, Confidence: 0.6},
 		}})
 	})
@@ -534,5 +540,117 @@ func TestFailOpenReasonStaysBounded(t *testing.T) {
 	}
 	if !utf8.ValidString(d2.Reason) {
 		t.Fatal("echoed choice was cut mid-rune")
+	}
+}
+
+// Switch policy: the first call establishes the thread's current model; a
+// later low-confidence switch on a large context stays put.
+func TestSwitchPolicySticky(t *testing.T) {
+	stub := &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, func(c *config.JevConfig) { c.MaxSwitchContext = 10 })
+	d1, ok := r.Decide(context.Background(), userTurn(t, "first"), testCatalog)
+	if !ok || d1.Source != SourceJev || d1.Provider != "glm" {
+		t.Fatalf("d1=%+v", d1)
+	}
+
+	stub.choice, stub.conf = "anthropic/claude-opus-5", 0.5
+	d2, ok := r.Decide(context.Background(), userTurn(t, "second"), testCatalog)
+	if !ok || d2.Source != SourceSticky || d2.Provider != "glm" || d2.Model != "glm-5.3-flash" {
+		t.Fatalf("d2=%+v", d2)
+	}
+	if d2.Pick != "anthropic/claude-opus-5" || d2.Lease != LeaseOneCall {
+		t.Fatalf("override not recorded: %+v", d2)
+	}
+	req := stub.last.Load()
+	if req.State.Current != "glm/glm-5.3-flash" || !req.State.CacheWarm || req.State.ContextTokensEst <= 10 {
+		t.Fatalf("dossier lacks switch cost: %+v", req.State)
+	}
+
+	stub.conf = 0.9
+	d3, _ := r.Decide(context.Background(), userTurn(t, "third"), testCatalog)
+	if d3.Source != SourceJev || d3.Provider != "anthropic" {
+		t.Fatalf("confident switch should pass: %+v", d3)
+	}
+}
+
+func TestSwitchPolicySmallContextSwitchesFreely(t *testing.T) {
+	stub := &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, nil) // default threshold ≫ test bodies
+	r.Decide(context.Background(), userTurn(t, "first"), testCatalog)
+	stub.choice, stub.conf = "anthropic/claude-opus-5", 0.5
+	d, _ := r.Decide(context.Background(), userTurn(t, "second"), testCatalog)
+	if d.Source != SourceJev || d.Provider != "anthropic" {
+		t.Fatalf("d=%+v", d)
+	}
+}
+
+func TestSwitchPolicyLowMargin(t *testing.T) {
+	stub := &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, nil)
+	r.Decide(context.Background(), userTurn(t, "first"), testCatalog)
+
+	stub.choice = "anthropic/claude-sonnet-5"
+	stub.probs = map[string]float64{"anthropic/claude-sonnet-5": 0.45, "glm/glm-5.3-flash": 0.40, "anthropic/claude-opus-5": 0.15}
+	d, _ := r.Decide(context.Background(), userTurn(t, "second"), testCatalog)
+	if d.Source != SourceLowConfidence || d.Provider != "glm" || d.Pick != "anthropic/claude-sonnet-5" {
+		t.Fatalf("d=%+v", d)
+	}
+	if d.Margin < 0.049 || d.Margin > 0.051 {
+		t.Fatalf("margin=%v", d.Margin)
+	}
+
+	stub.probs = map[string]float64{"anthropic/claude-sonnet-5": 0.8, "glm/glm-5.3-flash": 0.1}
+	d, _ = r.Decide(context.Background(), userTurn(t, "third"), testCatalog)
+	if d.Source != SourceJev || d.Model != "claude-sonnet-5" {
+		t.Fatalf("clear margin should pass: %+v", d)
+	}
+}
+
+func TestSwitchPolicyDisabled(t *testing.T) {
+	stub := &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, func(c *config.JevConfig) { c.MinMargin, c.MaxSwitchContext = -1, -1 })
+	r.Decide(context.Background(), userTurn(t, "first"), testCatalog)
+	stub.choice, stub.conf = "anthropic/claude-opus-5", 0.1
+	stub.probs = map[string]float64{"anthropic/claude-opus-5": 0.5, "glm/glm-5.3-flash": 0.49}
+	d, _ := r.Decide(context.Background(), userTurn(t, "second"), testCatalog)
+	if d.Source != SourceJev || d.Provider != "anthropic" {
+		t.Fatalf("d=%+v", d)
+	}
+}
+
+// A current model that is no longer a candidate (breaker OPEN) is not a place
+// to stay, and is not reported to Jev.
+func TestSwitchPolicyCurrentFilteredOut(t *testing.T) {
+	stub := &jevStub{choice: "anthropic/claude-opus-5", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, func(c *config.JevConfig) { c.MaxSwitchContext = 10 })
+	r.Decide(context.Background(), userTurn(t, "first"), testCatalog)
+	stub.choice, stub.conf = "glm/glm-5.3-flash", 0.1
+	d, _ := r.Decide(context.Background(), userTurn(t, "second"), testCatalog[2:])
+	if d.Source != SourceJev || d.Provider != "glm" {
+		t.Fatalf("d=%+v", d)
+	}
+	if cur := stub.last.Load().State.Current; cur != "" {
+		t.Fatalf("current=%q", cur)
+	}
+}
+
+func TestMargin(t *testing.T) {
+	crit := map[string]string{"a": "", "b": "", "c": ""}
+	cases := []struct {
+		probs map[string]float64
+		want  float64
+		ok    bool
+	}{
+		{nil, 0, false},
+		{map[string]float64{"a": 1}, 0, false},
+		{map[string]float64{"a": 0.6, "x": 0.9}, 0, false}, // unknown keys ignored
+		{map[string]float64{"a": 0.2, "b": 0.7, "c": 0.1}, 0.5, true},
+		{map[string]float64{"c": 0.3, "b": 0.3}, 0, true},
+	}
+	for _, tc := range cases {
+		got, ok := margin(tc.probs, crit)
+		if ok != tc.ok || (ok && (got < tc.want-1e-9 || got > tc.want+1e-9)) {
+			t.Errorf("margin(%v)=%v,%v want %v,%v", tc.probs, got, ok, tc.want, tc.ok)
+		}
 	}
 }

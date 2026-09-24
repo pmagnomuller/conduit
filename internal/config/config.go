@@ -89,13 +89,29 @@ type PathsConfig struct {
 // Catalog entries are the candidates Jev may choose between; when empty the
 // built-in DefaultCatalog is used.
 type JevConfig struct {
-	BaseURL         string      `toml:"base_url"`
-	APIKeyEnv       string      `toml:"api_key_env"`
-	TimeoutMS       int         `toml:"timeout_ms"`
-	LeaseTTLSeconds int         `toml:"lease_ttl_seconds"`
-	DecisionsPath   string      `toml:"decisions_path"` // "" disables the JSONL decision log
-	Catalog         []Candidate `toml:"catalog"`
+	BaseURL         string `toml:"base_url"`
+	APIKeyEnv       string `toml:"api_key_env"`
+	TimeoutMS       int    `toml:"timeout_ms"`
+	LeaseTTLSeconds int    `toml:"lease_ttl_seconds"`
+	DecisionsPath   string `toml:"decisions_path"` // "" disables the JSONL decision log
+	// MaxSwitchContext is the estimated context size (tokens) above which a
+	// switch away from the thread's current model needs SwitchConfidence:
+	// every switch is a cold prefix rebuild on the new model. 0 → default,
+	// negative disables the guard.
+	MaxSwitchContext int     `toml:"max_switch_context"`
+	SwitchConfidence float64 `toml:"switch_confidence"`
+	// MinMargin is the minimum p(top)−p(second) Jev must give before its pick
+	// is honoured; below it the thread stays put. 0 → default, negative disables.
+	MinMargin float64     `toml:"min_margin"`
+	Catalog   []Candidate `toml:"catalog"`
 }
+
+// Switch-cost defaults; see JevConfig.
+const (
+	DefaultMaxSwitchContext = 60000
+	DefaultSwitchConfidence = 0.8
+	DefaultMinMargin        = 0.15
+)
 
 // Candidate is one provider/model Jev may pick. It lives here (not in
 // internal/route) so route can import config without a cycle; route aliases it.
@@ -266,6 +282,15 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Jev.LeaseTTLSeconds <= 0 {
 		cfg.Jev.LeaseTTLSeconds = 600
+	}
+	if cfg.Jev.MaxSwitchContext == 0 {
+		cfg.Jev.MaxSwitchContext = DefaultMaxSwitchContext
+	}
+	if cfg.Jev.SwitchConfidence == 0 {
+		cfg.Jev.SwitchConfidence = DefaultSwitchConfidence
+	}
+	if cfg.Jev.MinMargin == 0 {
+		cfg.Jev.MinMargin = DefaultMinMargin
 	}
 	if cfg.Jev.BaseURL == "" {
 		cfg.Jev.BaseURL = "https://api.typesafe.ai/v1/systemone"
