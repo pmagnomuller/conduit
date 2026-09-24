@@ -161,7 +161,7 @@ finer-grained lease.
 "low_confidence"`; `margin` + `pick` logged. Falls to `current`, not
 `requested_model` — the requested id is often not what served the thread.
 
-### 4. Security-aware candidate filtering — high value, medium
+### 4. Security-aware candidate filtering — ✅ implemented (path-pattern filter)
 
 Directly from §IX, and more pointed in the primary: its example is Chinese
 providers, which for conduit means GLM and DeepSeek — both in the default
@@ -181,6 +181,12 @@ breaker filter runs in `proxy.go`):
 
 This makes "don't send secrets-adjacent turns to cheap third-party endpoints"
 configuration, not discipline — the note's exact point.
+
+*Shipped as:* `restrict_sensitive` / `restricted_providers` /
+`restricted_patterns` in `[jev]`, enforced in `internal/route/restrict.go`;
+see ARCHITECTURE §4.5. Simpler than the plan above: one trusted/untrusted
+split by provider instead of per-entry trust tiers and policy classes. Gap:
+auto-mode breaker failover is not covered.
 
 ### 5. Cost estimate per decision — medium
 

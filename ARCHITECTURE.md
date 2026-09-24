@@ -196,6 +196,7 @@ client input is clipped, rune-safe, before it goes anywhere:
 | `requested_model` | `model` | 128 chars |
 | `thinking_budget`, `n_messages`, `n_tools`, `has_image` | body | — |
 | `context_tokens_est` | body bytes / 4 — the rebuild cost of a switch | — |
+| `sensitive` | router: recent messages matched `restricted_patterns` | — |
 | `current`, `cache_warm` | router: catalog key that served this thread last; served < 5 min ago | — |
 
 The system prompt and tool schemas are never included.
@@ -246,19 +247,35 @@ stays — the router never invents a third choice. A `current` no longer in
 the filtered candidates (breaker OPEN) is not reported and cannot be stayed
 on. Negative thresholds disable either guard.
 
-### 4.5 Fail-open
+### 4.5 Sensitive-content restriction
+
+`restrict.go`. Before Jev is asked (and before lease reuse), the raw content
+of the last 6 messages — tool_use inputs, tool results, text — is matched
+against `restricted_patterns` (regexps; default covers `.env*`, `~/.ssh`,
+private-key and keystore extensions, `*.tfvars`/`*.tfstate`, kubeconfig,
+`~/.aws/credentials`, `.netrc`, `.npmrc`, `.pgpass`, `secrets.*`). On a match
+`restricted_providers` (`glm`, `deepseek`) are dropped from the candidates,
+the dossier carries `sensitive: true`, and the decision records
+`policy: restricted`. Because leases and `current` are checked against the
+filtered list, neither can carry a thread to a dropped provider; a Jev answer
+naming one is outside the catalog and falls open. No trusted candidate →
+fail-open without asking Jev. Patterns err toward matching: a false positive
+only keeps a turn on Anthropic. Scope is jev mode; auto's breaker failover is
+unchanged.
+
+### 4.6 Fail-open
 
 `Decide` never blocks past the timeout, never panics (a `recover` converts a
 panic into a fail-open), and never surfaces an error to the client. Any
 failure yields `ok=false`; the proxy then serves the request exactly as
 `auto` would. The reason (redacted) is recorded.
 
-### 4.6 Records
+### 4.7 Records
 
 Every decision — including fail-open — goes to an in-memory ring (200, shown as
 `jev.recent` in the UI) and is appended to `decisions.jsonl` (mode 0600,
 rotated at 4 MiB to `decisions.jsonl.1`). Fields are the already-clipped
-dossier values plus provider, model, lease, source, confidence, margin, pick, latency.
+dossier values plus provider, model, lease, source, confidence, margin, pick, policy, latency.
 
 ---
 

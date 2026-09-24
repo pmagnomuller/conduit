@@ -122,6 +122,14 @@ stays put (`source: sticky`), and a near-tie between Jev's top two picks stays
 put too (`source: low_confidence`). Tune with `max_switch_context`,
 `switch_confidence`, `min_margin` in `[jev]`.
 
+**Sensitive turns stay first-party.** If the recent messages reference secret
+material (`.env*`, `~/.ssh`, `*.pem`, `*.tfvars`, kubeconfig, cloud
+credentials, …), GLM and DeepSeek are removed from the candidates before Jev
+sees them (`policy: restricted`), and a Jev answer naming them falls open.
+Configure with `restrict_sensitive`, `restricted_providers`,
+`restricted_patterns`. This covers jev mode only — auto mode's breaker
+failover still sends traffic to GLM/DeepSeek while Anthropic is OPEN.
+
 **Half-open probes bypass Jev.** When an Anthropic entry's open window has
 expired, that one call goes to Anthropic with the model you asked for (so the
 breaker can decide whether to close) rather than to Jev's pick — the same probe

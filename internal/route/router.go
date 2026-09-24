@@ -30,7 +30,9 @@ type Decision struct {
 	Confidence     float64   `json:"confidence,omitempty"`
 	Margin         float64   `json:"margin,omitempty"` // Jev's p(top)−p(second), when given
 	// Pick is Jev's choice when the router overrode it (sticky, low_confidence).
-	Pick      string `json:"pick,omitempty"`
+	Pick string `json:"pick,omitempty"`
+	// Policy is "restricted" when sensitive content limited the candidates.
+	Policy    string `json:"policy,omitempty"`
 	LatencyMS int64  `json:"latency_ms"`
 }
 
@@ -48,6 +50,8 @@ const (
 	// cacheWarmWindow approximates the provider prompt-cache TTL (Anthropic's
 	// default is five minutes); a thread served within it is cache-warm.
 	cacheWarmWindow = 5 * time.Minute
+
+	PolicyRestricted = "restricted"
 
 	recentCap = 200
 	// leaseCap bounds the lease map; conversations that never end their
@@ -84,6 +88,8 @@ type Router struct {
 	maxSwitch  int
 	switchConf float64
 	minMargin  float64
+	// restricted is non-nil when sensitive-turn filtering is on.
+	restricted *restriction
 	log        *slog.Logger
 	now        func() time.Time // injectable for lease tests
 
@@ -126,6 +132,9 @@ func New(cfg config.JevConfig, apiKey string, log *slog.Logger) *Router {
 		now:        time.Now,
 		leases:     map[string]lease{},
 		history:    map[string]served{},
+	}
+	if cfg.RestrictSensitive && len(cfg.RestrictedProviders) > 0 {
+		r.restricted = newRestriction(cfg.RestrictedPatterns, cfg.RestrictedProviders, log)
 	}
 	if r.enabled {
 		r.client = &client{
@@ -170,8 +179,16 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 	}()
 
 	dossier = Extract(body)
+	if r.restricted != nil && r.restricted.matches(dossier.recent) {
+		dossier.Sensitive = true
+		candidates = r.restricted.filter(candidates)
+	}
 	if len(candidates) == 0 {
-		return r.failOpen(start, dossier, "no candidates"), false
+		reason := "no candidates"
+		if dossier.Sensitive {
+			reason = "sensitive content and no trusted candidate"
+		}
+		return r.failOpen(start, dossier, reason), false
 	}
 
 	r.fillCurrent(&dossier, candidates, start)
@@ -183,6 +200,7 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		ld.RequestedModel = dossier.RequestedModel
 		ld.Reason = ""
 		ld.Pick, ld.Margin = "", 0
+		ld.Policy = policyOf(dossier)
 		ld.LatencyMS = r.now().Sub(start).Milliseconds()
 		r.remember(dossier, ld, start)
 		r.record(ld)
@@ -211,6 +229,7 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		Source:         source,
 		Confidence:     res.Confidence,
 		Margin:         res.Margin,
+		Policy:         policyOf(dossier),
 		LatencyMS:      r.now().Sub(start).Milliseconds(),
 	}
 	if source != SourceJev {
@@ -297,6 +316,7 @@ func (r *Router) failOpen(start time.Time, d Dossier, reason string) Decision {
 		Step:           d.Step,
 		Source:         SourceFailOpen,
 		Reason:         redact.String(reason),
+		Policy:         policyOf(d),
 		LatencyMS:      r.now().Sub(start).Milliseconds(),
 	}
 	r.record(dec)

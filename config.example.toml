@@ -94,6 +94,14 @@ switch_confidence = 0.8
 # Minimum p(top)-p(second) from Jev before its pick is honoured; below it the
 # thread stays on its current model (source "low_confidence"). Negative disables.
 min_margin = 0.15
+# Turns whose recent messages mention secret material (.env, ~/.ssh, *.pem,
+# *.tfvars, kubeconfig, cloud credentials, ...) never go to these providers in
+# jev mode (decision policy "restricted"). restricted_patterns (regexps)
+# replaces the built-in list. Note: auto mode's breaker failover is not
+# covered; with Anthropic OPEN, auto still fails over to GLM/DeepSeek.
+restrict_sensitive = true
+restricted_providers = ["glm", "deepseek"]
+# restricted_patterns = ['\.env\b', '\.ssh/']
 
 # Candidate catalog. Omit to use the built-in default (opus/sonnet/haiku,
 # glm-5.3, glm-5.3-flash, deepseek-v4-flash). Defining any entry replaces

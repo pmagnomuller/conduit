@@ -310,3 +310,31 @@ func TestEnvFileValuesReachApplyEnv(t *testing.T) {
 		t.Fatalf("env must beat .env: timeout=%d", cfg.Jev.TimeoutMS)
 	}
 }
+
+func TestLoadRestrictedPatterns(t *testing.T) {
+	t.Setenv("ZAI_API_KEY", "k")
+	load := func(body string) (config.Config, error) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return config.Load(path)
+	}
+	cfg, err := load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Jev.RestrictSensitive || len(cfg.Jev.RestrictedPatterns) == 0 || len(cfg.Jev.RestrictedProviders) != 2 {
+		t.Fatalf("defaults: %+v", cfg.Jev)
+	}
+	cfg, err = load("[jev]\nrestricted_patterns = ['\\.env\\b']\nrestrict_sensitive = false\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Jev.RestrictSensitive || len(cfg.Jev.RestrictedPatterns) != 1 || cfg.Jev.RestrictedPatterns[0] != `\.env\b` {
+		t.Fatalf("override: %+v", cfg.Jev)
+	}
+	if _, err := load("[jev]\nrestricted_patterns = ['(']\n"); err == nil {
+		t.Fatal("invalid regexp accepted")
+	}
+}

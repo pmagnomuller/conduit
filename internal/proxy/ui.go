@@ -444,14 +444,15 @@ function renderJev(jev) {
     var conf = typeof d.confidence === 'number' ? Math.max(0, Math.min(1, d.confidence)) : 0;
     var pct = Math.round(conf * 100);
     var lat = typeof d.latency_ms === 'number' ? d.latency_ms + 'ms' : '—';
-    var why = d.reason || (d.pick ? 'Jev picked ' + d.pick : '');
+    var why = [d.reason, d.pick ? 'Jev picked ' + d.pick : '', d.policy ? 'policy: ' + d.policy : '']
+      .filter(Boolean).join(' · ');
     var reason = why ? ' title="' + esc(why) + '"' : '';
     return '<div class="dec">' +
       '<span class="t">' + fmtTime(d.at) + '</span>' +
       '<span class="rt"><span class="req" title="' + esc(d.requested_model) + '">' + esc(d.requested_model || '?') +
         '</span><span class="arrow">&rarr;</span>' + pill(d.provider, d.model) + '</span>' +
       '<span class="muted">' + esc(d.step || '—') + (d.lease ? ' <span class="small">/' + esc(d.lease) + '</span>' : '') + '</span>' +
-      '<span><span class="src ' + srcCls + '"' + reason + '>' + esc(src) + '</span></span>' +
+      '<span><span class="src ' + srcCls + '"' + reason + '>' + esc(src) + (d.policy ? ' &#128274;' : '') + '</span></span>' +
       '<span class="conf"><span class="bar" data-n="' + pct + '"><span class="fill" style="width:' + pct + '%"></span></span>' + (conf ? pct + '%' : '') + '</span>' +
       '<span class="lat">' + esc(lat) + '</span>' +
       '</div>';

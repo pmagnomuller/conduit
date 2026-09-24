@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -651,6 +652,107 @@ func TestMargin(t *testing.T) {
 		got, ok := margin(tc.probs, crit)
 		if ok != tc.ok || (ok && (got < tc.want-1e-9 || got > tc.want+1e-9)) {
 			t.Errorf("margin(%v)=%v,%v want %v,%v", tc.probs, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func restrictedRouter(t *testing.T, stub *jevStub) (*Router, *jevStub) {
+	return newTestRouter(t, stub, func(c *config.JevConfig) {
+		c.RestrictSensitive = true
+		c.RestrictedProviders = []string{"glm", "deepseek"}
+		c.RestrictedPatterns = config.DefaultRestrictedPatterns()
+	})
+}
+
+func readStep(t *testing.T, path, result string) []byte {
+	return mustJSON(t, map[string]any{
+		"model":  "claude-opus-5",
+		"system": "sys",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "opening message"},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "tool_use", "id": "ta", "name": "Read", "input": map[string]any{"file_path": path},
+			}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "tool_result", "tool_use_id": "ta", "content": result,
+			}}},
+		},
+	})
+}
+
+func TestRestrictedDropsUntrustedProviders(t *testing.T) {
+	r, stub := restrictedRouter(t, &jevStub{choice: "anthropic/claude-sonnet-5", lease: LeaseOneCall})
+	d, ok := r.Decide(context.Background(), readStep(t, "/repo/.env", "API_KEY=x"), testCatalog)
+	if !ok || d.Policy != PolicyRestricted || d.Provider != "anthropic" {
+		t.Fatalf("d=%+v", d)
+	}
+	req := stub.last.Load()
+	if !req.State.Sensitive {
+		t.Fatal("dossier not marked sensitive")
+	}
+	for k := range req.Questions["model"].Criteria {
+		if strings.HasPrefix(k, "glm/") {
+			t.Fatalf("untrusted candidate offered: %s", k)
+		}
+	}
+}
+
+// Jev's answer is untrusted: naming a filtered provider falls open rather
+// than routing secrets to it.
+func TestRestrictedJevCannotRouteAround(t *testing.T) {
+	r, _ := restrictedRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall})
+	d, ok := r.Decide(context.Background(), readStep(t, "/home/u/.ssh/id_ed25519", "-----BEGIN"), testCatalog)
+	if ok || d.Source != SourceFailOpen || d.Policy != PolicyRestricted {
+		t.Fatalf("d=%+v ok=%v", d, ok)
+	}
+}
+
+func TestRestrictedNoTrustedCandidate(t *testing.T) {
+	r, stub := restrictedRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall})
+	_, ok := r.Decide(context.Background(), readStep(t, "infra/prod.tfvars", "x"), testCatalog[2:])
+	if ok || stub.calls.Load() != 0 {
+		t.Fatalf("ok=%v calls=%d", ok, stub.calls.Load())
+	}
+}
+
+// A lease granted before the secret showed up must not carry the thread to
+// an untrusted provider.
+func TestRestrictedBreaksUntrustedLease(t *testing.T) {
+	r, stub := restrictedRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseUserTurn})
+	d1, _ := r.Decide(context.Background(), readStep(t, "src/main.go", "package main"), testCatalog)
+	if d1.Provider != "glm" || d1.Policy != "" {
+		t.Fatalf("d1=%+v", d1)
+	}
+	stub.choice = "anthropic/claude-opus-5"
+	d2, ok := r.Decide(context.Background(), readStep(t, "src/.env.local", "SECRET=1"), testCatalog)
+	if !ok || d2.Source != SourceJev || d2.Provider != "anthropic" {
+		t.Fatalf("d2=%+v", d2)
+	}
+}
+
+func TestRestrictedPatterns(t *testing.T) {
+	var res []*regexp.Regexp
+	for _, p := range config.DefaultRestrictedPatterns() {
+		res = append(res, regexp.MustCompile(p))
+	}
+	hit := func(s string) bool {
+		raw, _ := json.Marshal(s)
+		for _, re := range res {
+			if re.Match(raw) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, s := range []string{".env", "cat .env.production", "a/b/.env", "ls\n.env", "~/.ssh/config",
+		"id_rsa", "cert.pem", "prod.tfvars", "~/.kube/config", "~/.aws/credentials", "secrets.yaml"} {
+		if !hit(s) {
+			t.Errorf("expected match: %q", s)
+		}
+	}
+	for _, s := range []string{"process.env.FOO", "environment", "item.key", "obj.keys()", "src/main.go", "envelope"} {
+		if hit(s) {
+			t.Errorf("unexpected match: %q", s)
 		}
 	}
 }

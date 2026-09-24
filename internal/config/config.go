@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -102,8 +103,14 @@ type JevConfig struct {
 	SwitchConfidence float64 `toml:"switch_confidence"`
 	// MinMargin is the minimum p(top)−p(second) Jev must give before its pick
 	// is honoured; below it the thread stays put. 0 → default, negative disables.
-	MinMargin float64     `toml:"min_margin"`
-	Catalog   []Candidate `toml:"catalog"`
+	MinMargin float64 `toml:"min_margin"`
+	// RestrictSensitive drops RestrictedProviders from the candidates of any
+	// call whose recent messages match RestrictedPatterns (secrets, keys,
+	// infra credentials), so those turns stay on first-party models.
+	RestrictSensitive   bool        `toml:"restrict_sensitive"`
+	RestrictedProviders []string    `toml:"restricted_providers"`
+	RestrictedPatterns  []string    `toml:"restricted_patterns"` // regexps; nil → DefaultRestrictedPatterns
+	Catalog             []Candidate `toml:"catalog"`
 }
 
 // Switch-cost defaults; see JevConfig.
@@ -112,6 +119,21 @@ const (
 	DefaultSwitchConfidence = 0.8
 	DefaultMinMargin        = 0.15
 )
+
+// DefaultRestrictedPatterns match paths and names of secret material. They
+// err toward matching: a false positive only keeps a turn on Anthropic.
+func DefaultRestrictedPatterns() []string {
+	return []string{
+		`(^|[/\\\s"'=]|\\[nt])\.env(\.[\w-]+)?($|[\s"'/\\])`, // \\[nt]: escapes in raw JSON
+		`\.ssh/`,
+		`\bid_(rsa|ed25519|ecdsa|dsa)\b`,
+		`\.(pem|p12|pfx|keystore|jks)\b`,
+		`\.tfvars\b|\.tfstate\b`,
+		`\bkubeconfig\b|\.kube/config`,
+		`\.aws/credentials|\.netrc\b|\.npmrc\b|\.pgpass\b`,
+		`\bsecrets?\.(ya?ml|json|toml)\b`,
+	}
+}
 
 // Candidate is one provider/model Jev may pick. It lives here (not in
 // internal/route) so route can import config without a cycle; route aliases it.
@@ -202,6 +224,10 @@ func Default() Config {
 			TimeoutMS:       4000,
 			LeaseTTLSeconds: 600,
 			DecisionsPath:   "~/.local/state/conduit/decisions.jsonl",
+			// GLM (z.ai) and DeepSeek are third-party endpoints whose data
+			// handling we do not control; secret-adjacent turns skip them.
+			RestrictSensitive:   true,
+			RestrictedProviders: []string{"glm", "deepseek"},
 			// Catalog left nil so a TOML [[jev.catalog]] replaces rather than
 			// appends; Load fills DefaultCatalog when still empty.
 		},
@@ -291,6 +317,14 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Jev.MinMargin == 0 {
 		cfg.Jev.MinMargin = DefaultMinMargin
+	}
+	if cfg.Jev.RestrictedPatterns == nil {
+		cfg.Jev.RestrictedPatterns = DefaultRestrictedPatterns()
+	}
+	for _, p := range cfg.Jev.RestrictedPatterns {
+		if _, err := regexp.Compile(p); err != nil {
+			return Config{}, fmt.Errorf("jev.restricted_patterns: %q: %w", p, err)
+		}
 	}
 	if cfg.Jev.BaseURL == "" {
 		cfg.Jev.BaseURL = "https://api.typesafe.ai/v1/systemone"

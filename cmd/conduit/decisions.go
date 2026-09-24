@@ -25,6 +25,7 @@ type decision struct {
 	Confidence     float64   `json:"confidence,omitempty"`
 	Margin         float64   `json:"margin,omitempty"`
 	Pick           string    `json:"pick,omitempty"`
+	Policy         string    `json:"policy,omitempty"`
 	LatencyMS      int64     `json:"latency_ms"`
 }
 
@@ -129,6 +130,9 @@ func formatDecision(d decision) string {
 	}
 	if d.Pick != "" {
 		line += " pick=" + d.Pick
+	}
+	if d.Policy != "" {
+		line += " policy=" + d.Policy
 	}
 	line += fmt.Sprintf(" %dms", d.LatencyMS)
 	if d.Reason != "" {

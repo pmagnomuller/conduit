@@ -56,9 +56,15 @@ type Dossier struct {
 	// Filled by the router, not by Extract.
 	Current   string `json:"current,omitempty"`
 	CacheWarm bool   `json:"cache_warm,omitempty"`
+	// Sensitive marks a call whose recent messages reference secret material;
+	// the router has already limited the candidates to trusted providers.
+	Sensitive bool `json:"sensitive,omitempty"`
 
 	// fingerprint is the lease key; not sent to Jev.
 	fingerprint string
+	// recent is the raw content of the last imageLookback messages, scanned
+	// for sensitive paths by the router. Slices of the body, not copies.
+	recent []json.RawMessage
 	// toolSet is the sorted unique tool names of this step; lease matching.
 	toolSet []string
 }
@@ -315,6 +321,9 @@ func Extract(body []byte) Dossier {
 	start := n - imageLookback
 	if start < 0 {
 		start = 0
+	}
+	for _, m := range msgs[start:] {
+		d.recent = append(d.recent, m.Content)
 	}
 scan:
 	for _, m := range msgs[start:] {
