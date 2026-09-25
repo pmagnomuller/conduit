@@ -1,4 +1,4 @@
-.PHONY: setup start stop status uninstall build conduitctl test
+.PHONY: setup start stop status uninstall build conduitctl test macos-app
 
 setup:
 	./setup.sh
@@ -25,3 +25,6 @@ conduitctl:
 
 test:
 	go test ./...
+
+macos-app:
+	macos/ConduitBar/build-app.sh
