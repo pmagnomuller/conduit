@@ -178,12 +178,25 @@ func TestUnifiedResetUntil(t *testing.T) {
 
 func TestProactiveUtilization(t *testing.T) {
 	hdr := http.Header{
-		"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.99"},
-		"Anthropic-Ratelimit-Unified-5h-Reset":       []string{itoa(time.Now().Add(time.Hour).Unix())},
+		"Anthropic-Ratelimit-Unified-Overage-Utilization": []string{"0.99"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":            []string{itoa(time.Now().Add(time.Hour).Unix())},
 	}
 	ok, reason, _ := classify.ProactiveQuota(hdr, 0, 0.95)
 	if !ok {
 		t.Fatalf("expected proactive open, reason=%s", reason)
+	}
+}
+
+func TestProactiveUtilizationIgnoresRateWindows(t *testing.T) {
+	// 5h/7d utilization is >0 on every healthy response; a low threshold must
+	// not trip on them, only on the billable overage tier.
+	hdr := http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.99"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": []string{"0.99"},
+	}
+	ok, reason, _ := classify.ProactiveQuota(hdr, 0, 0.01)
+	if ok {
+		t.Fatalf("rate-window utilization must not trip, reason=%s", reason)
 	}
 }
 

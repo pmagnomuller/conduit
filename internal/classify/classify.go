@@ -184,7 +184,10 @@ func ProactiveQuota(hdr http.Header, remainingThreshold int, utilizationThreshol
 		if !strings.HasPrefix(lk, "anthropic-ratelimit-unified-") {
 			continue
 		}
-		if utilizationThreshold > 0 && strings.HasSuffix(lk, "-utilization") {
+		// Only the overage tier signals billable usage credits; the 5h/7d
+		// windows are always >0 during normal use and would trip a low
+		// threshold on every healthy request.
+		if utilizationThreshold > 0 && strings.HasSuffix(lk, "-overage-utilization") {
 			for _, v := range vals {
 				f, err := strconv.ParseFloat(v, 64)
 				if err == nil && f >= utilizationThreshold {
