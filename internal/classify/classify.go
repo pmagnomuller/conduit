@@ -184,10 +184,13 @@ func ProactiveQuota(hdr http.Header, remainingThreshold int, utilizationThreshol
 		if !strings.HasPrefix(lk, "anthropic-ratelimit-unified-") {
 			continue
 		}
-		// Only the overage tier signals billable usage credits; the 5h/7d
-		// windows are always >0 during normal use and would trip a low
-		// threshold on every healthy request.
-		if utilizationThreshold > 0 && strings.HasSuffix(lk, "-overage-utilization") {
+		// Skip the overage tier: it reports the org-wide overage pool (seen
+		// pinned at 1.02 with overage-status=rejected,
+		// disabled-reason=org_spend_cap_reached) while the plan windows still
+		// have room. A plan window (5h/7d) nearing full is the point where the
+		// next request would start drawing usage credits.
+		if utilizationThreshold > 0 && strings.HasSuffix(lk, "-utilization") &&
+			!strings.HasSuffix(lk, "-overage-utilization") {
 			for _, v := range vals {
 				f, err := strconv.ParseFloat(v, 64)
 				if err == nil && f >= utilizationThreshold {

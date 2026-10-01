@@ -178,8 +178,8 @@ func TestUnifiedResetUntil(t *testing.T) {
 
 func TestProactiveUtilization(t *testing.T) {
 	hdr := http.Header{
-		"Anthropic-Ratelimit-Unified-Overage-Utilization": []string{"0.99"},
-		"Anthropic-Ratelimit-Unified-5h-Reset":            []string{itoa(time.Now().Add(time.Hour).Unix())},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.99"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":       []string{itoa(time.Now().Add(time.Hour).Unix())},
 	}
 	ok, reason, _ := classify.ProactiveQuota(hdr, 0, 0.95)
 	if !ok {
@@ -187,16 +187,19 @@ func TestProactiveUtilization(t *testing.T) {
 	}
 }
 
-func TestProactiveUtilizationIgnoresRateWindows(t *testing.T) {
-	// 5h/7d utilization is >0 on every healthy response; a low threshold must
-	// not trip on them, only on the billable overage tier.
+func TestProactiveUtilizationIgnoresOverage(t *testing.T) {
+	// Observed on healthy responses with plan windows far from full: the
+	// org-wide overage pool is capped, which must not open the breaker.
 	hdr := http.Header{
-		"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.99"},
-		"Anthropic-Ratelimit-Unified-7d-Utilization": []string{"0.99"},
+		"Anthropic-Ratelimit-Unified-Overage-Utilization":     []string{"1.02"},
+		"Anthropic-Ratelimit-Unified-Overage-Status":          []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": []string{"org_spend_cap_reached"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization":          []string{"0.22"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization":          []string{"0.11"},
 	}
-	ok, reason, _ := classify.ProactiveQuota(hdr, 0, 0.01)
+	ok, reason, _ := classify.ProactiveQuota(hdr, 0, 0.98)
 	if ok {
-		t.Fatalf("rate-window utilization must not trip, reason=%s", reason)
+		t.Fatalf("overage utilization must not trip, reason=%s", reason)
 	}
 }
 
