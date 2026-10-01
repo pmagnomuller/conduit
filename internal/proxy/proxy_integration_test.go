@@ -43,6 +43,8 @@ type fakeUpstreams struct {
 	failoverProvider string
 	// treatHeaderless429 sets cfg.Breaker.TreatHeaderless429AsQuota (false default).
 	treatHeaderless429 bool
+	// proactiveUtilization sets cfg.Breaker.ProactiveUtilization (0 = disabled).
+	proactiveUtilization float64
 	// decider, when set, is injected as the jev router (nil = jev disabled).
 	decider proxy.Decider
 
@@ -126,6 +128,7 @@ func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Brea
 	if f.treatHeaderless429 {
 		cfg.Breaker.TreatHeaderless429AsQuota = true
 	}
+	cfg.Breaker.ProactiveUtilization = f.proactiveUtilization
 	cfg.Paths.StatePath = statePath
 	cfg.Log.CapturePath = capturePath
 	cfg.Log.CaptureUpstreamErrors = true
@@ -1893,5 +1896,104 @@ func TestDeepSeekOmitsToolsKeyWhenOnlyArtifact(t *testing.T) {
 	f.mu.Unlock()
 	if len(bash.Tools) != 1 || bash.Tools[0].Name != "Bash" {
 		t.Fatalf("tools=%v want [Bash]", bash.Tools)
+	}
+}
+
+// setUnifiedHeaders writes the anthropic-ratelimit-unified-* headers a healthy
+// 200 carries, as captured from a Team plan whose org-wide overage pool is at
+// its spend cap.
+func setUnifiedHeaders(w http.ResponseWriter, fiveHour, sevenDay string) {
+	h := w.Header()
+	h.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+	h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+	h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", fiveHour)
+	h.Set("Anthropic-Ratelimit-Unified-5h-Reset", "9999999999")
+	h.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+	h.Set("Anthropic-Ratelimit-Unified-7d-Utilization", sevenDay)
+	h.Set("Anthropic-Ratelimit-Unified-7d-Reset", "9999999999")
+	h.Set("Anthropic-Ratelimit-Unified-Overage-Utilization", "1.02")
+	h.Set("Anthropic-Ratelimit-Unified-Overage-Status", "rejected")
+	h.Set("Anthropic-Ratelimit-Unified-Overage-Disabled-Reason", "org_spend_cap_reached")
+	h.Set("Anthropic-Ratelimit-Unified-Overage-Surpassed-Threshold", "1.0")
+	h.Set("Anthropic-Ratelimit-Unified-Upgrade-Paths", "overage")
+}
+
+// A capped org overage pool must not divert traffic while the plan windows
+// still have room: that sent every request to DeepSeek with the subscription
+// at 22%/11%.
+func TestProactiveIgnoresCappedOrgOverage(t *testing.T) {
+	f := &fakeUpstreams{enableDeepSeek: true, failoverProvider: "deepseek", proactiveUtilization: 0.98}
+	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+		setUnifiedHeaders(w, "0.22", "0.11")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_a","type":"message","role":"assistant","content":[]}`))
+	}
+	f.glm = func(w http.ResponseWriter, r *http.Request) { t.Fatal("glm must not be called") }
+
+	srv, br, _ := newGateway(t, f)
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`)
+	for i := 0; i < 3; i++ {
+		res := post(t, srv.URL+"/v1/messages", reqBody, fakeToken)
+		_, _ = io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != 200 || res.Header.Get("X-Conduit-Provider") != "anthropic" {
+			t.Fatalf("req %d: status=%d provider=%q", i, res.StatusCode, res.Header.Get("X-Conduit-Provider"))
+		}
+	}
+	if f.anthropicHits.Load() != 3 || f.deepSeekHits.Load() != 0 {
+		t.Fatalf("anthropic=%d deepseek=%d", f.anthropicHits.Load(), f.deepSeekHits.Load())
+	}
+	if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Closed {
+		t.Fatalf("breaker=%s, want closed", st)
+	}
+}
+
+// A plan window nearing full opens the breaker on the response that crossed
+// the threshold, so the following request goes to DeepSeek before any usage
+// credits are drawn.
+func TestProactivePlanWindowNearFullFailsOverToDeepSeek(t *testing.T) {
+	for _, tc := range []struct{ name, fiveHour, sevenDay string }{
+		{"5h window", "0.99", "0.40"},
+		{"7d window", "0.30", "0.98"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeUpstreams{enableDeepSeek: true, failoverProvider: "deepseek", proactiveUtilization: 0.98}
+			f.anthropic = func(w http.ResponseWriter, r *http.Request) {
+				setUnifiedHeaders(w, tc.fiveHour, tc.sevenDay)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`{"id":"msg_a","type":"message","role":"assistant","content":[]}`))
+			}
+			f.glm = func(w http.ResponseWriter, r *http.Request) { t.Fatal("glm must not be called") }
+			f.deepseek = func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"text","text":"ds"}]}`))
+			}
+
+			srv, br, _ := newGateway(t, f)
+			reqBody := []byte(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`)
+
+			first := post(t, srv.URL+"/v1/messages", reqBody, fakeToken)
+			_, _ = io.ReadAll(first.Body)
+			first.Body.Close()
+			if first.StatusCode != 200 || first.Header.Get("X-Conduit-Provider") != "anthropic" {
+				t.Fatalf("first: status=%d provider=%q", first.StatusCode, first.Header.Get("X-Conduit-Provider"))
+			}
+			if st := br.Decide("anthropic", "claude-opus-5", time.Now()); st != breaker.Open {
+				t.Fatalf("breaker=%s, want open", st)
+			}
+
+			second := post(t, srv.URL+"/v1/messages", reqBody, fakeToken)
+			_, _ = io.ReadAll(second.Body)
+			second.Body.Close()
+			if second.StatusCode != 200 || second.Header.Get("X-Conduit-Provider") != "deepseek" {
+				t.Fatalf("second: status=%d provider=%q", second.StatusCode, second.Header.Get("X-Conduit-Provider"))
+			}
+			if f.anthropicHits.Load() != 1 || f.deepSeekHits.Load() != 1 {
+				t.Fatalf("anthropic=%d deepseek=%d", f.anthropicHits.Load(), f.deepSeekHits.Load())
+			}
+		})
 	}
 }
