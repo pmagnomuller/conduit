@@ -20,3 +20,8 @@ claude-glm-gateway
 state.json
 upstream-errors.jsonl
 .conduit-run-result.txt
+
+# Local agent harness / session state
+.harness/
+.omo/
+logs/
