@@ -414,6 +414,15 @@ Anthropic and GLM accept it). If that was the only declared tool, the request
 goes out without a `tools` key at all. This applies in every routing mode and
 is the one place conduit does not forward your tool list untouched.
 
+Also on the DeepSeek tier only, a request that carries tools but has an
+assistant turn without an echoed `thinking` block (typical after a failover
+mid-session: Anthropic turns that skipped thinking, `redacted_thinking`, or
+GLM-served turns) is sent with `thinking` set to `disabled` and its
+`thinking`/`redacted_thinking` blocks removed. DeepSeek thinks by default and
+otherwise rejects such a request with 400 "The `content[].thinking` in the
+thinking mode must be passed back to the API". Histories that already echo
+thinking on every assistant turn are forwarded with thinking intact.
+
 Claude Code sends Anthropic model IDs. On the GLM/DeepSeek paths the gateway
 rewrites only the JSON `model` field using `[glm.model_map]` /
 `[deepseek.model_map]` / `default_model` (see `config.example.toml`).

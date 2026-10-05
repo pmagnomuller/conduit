@@ -758,6 +758,194 @@ func TestDeepSeekStripsArtifactTool(t *testing.T) {
 	}
 }
 
+// deepSeekThinkingValidator mimics DeepSeek's Anthropic-compatible endpoint:
+// thinking is on unless disabled, and a request carrying tools must echo a
+// thinking block on every assistant turn or it 400s.
+// The harness has already drained r.Body into f.deepSeekBodies.
+func deepSeekThinkingValidator(t *testing.T, f *fakeUpstreams) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		body := f.deepSeekBodies[len(f.deepSeekBodies)-1]
+		f.mu.Unlock()
+		var req struct {
+			Thinking *struct {
+				Type string `json:"type"`
+			} `json:"thinking"`
+			Tools    []json.RawMessage `json:"tools"`
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("deepseek got invalid json: %v", err)
+		}
+		thinkingOn := req.Thinking == nil || req.Thinking.Type != "disabled"
+		if thinkingOn && len(req.Tools) > 0 {
+			for _, m := range req.Messages {
+				if m.Role != "assistant" {
+					continue
+				}
+				var blocks []struct {
+					Type     string `json:"type"`
+					Thinking string `json:"thinking"`
+				}
+				_ = json.Unmarshal(m.Content, &blocks)
+				echoed := false
+				for _, b := range blocks {
+					if b.Type == "thinking" && b.Thinking != "" {
+						echoed = true
+					}
+				}
+				if !echoed {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(`{"error":{"message":"The ` + "`content[].thinking`" + ` in the thinking mode must be passed back to the API. (request_id: test)","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}`))
+					return
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_ds","type":"message","role":"assistant","content":[{"type":"text","text":"ds"}]}`))
+	}
+}
+
+// canonicalJSON re-encodes raw with sorted keys so bodies compare exactly.
+func canonicalJSON(t *testing.T, raw []byte) string {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("invalid json %s: %v", raw, err)
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func postToForcedDeepSeek(t *testing.T, reqBody []byte) []byte {
+	t.Helper()
+	f := &fakeUpstreams{enableDeepSeek: true}
+	f.deepseek = deepSeekThinkingValidator(t, f)
+	srv, br, _ := newGateway(t, f)
+	br.SetForce("deepseek", "")
+
+	res := post(t, srv.URL+"/v1/messages", reqBody, fakeToken)
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("status=%d body=%s", res.StatusCode, body)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.deepSeekBodies) != 1 {
+		t.Fatalf("deepseek bodies=%d, want 1", len(f.deepSeekBodies))
+	}
+	return f.deepSeekBodies[0]
+}
+
+// A Claude Code tool loop that began on Anthropic: the second assistant turn
+// skipped thinking (adaptive) and the first carries a redacted block. DeepSeek
+// would 400 on it, so the gateway sends it as a non-thinking request.
+func TestDeepSeekDisablesThinkingWhenHistoryLacksIt(t *testing.T) {
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":64,"stream":false,
+		"thinking":{"type":"adaptive"},
+		"tools":[
+			{"name":"Artifact","description":"render","input_schema":{"type":"object","properties":{"content":{"type":"string"}}}},
+			{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}
+		],
+		"messages":[
+			{"role":"user","content":"list files"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"need ls","signature":"sig-anthropic-1"},
+				{"type":"redacted_thinking","data":"opaque"},
+				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.go"}]},
+			{"role":"assistant","content":[
+				{"type":"text","text":"now cat"},
+				{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"cat a.go"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"package a"}]}
+		]}`)
+
+	got := postToForcedDeepSeek(t, reqBody)
+
+	want := []byte(`{"model":"deepseek-v4-pro","max_tokens":64,"stream":false,
+		"thinking":{"type":"disabled"},
+		"tools":[
+			{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}
+		],
+		"messages":[
+			{"role":"user","content":"list files"},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.go"}]},
+			{"role":"assistant","content":[
+				{"type":"text","text":"now cat"},
+				{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"cat a.go"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"package a"}]}
+		]}`)
+	if canonicalJSON(t, got) != canonicalJSON(t, want) {
+		t.Fatalf("deepseek body:\n got %s\nwant %s", canonicalJSON(t, got), canonicalJSON(t, want))
+	}
+}
+
+// When every assistant turn already echoes thinking, DeepSeek accepts the
+// request as is, so the gateway keeps thinking on and only rewrites the model.
+func TestDeepSeekKeepsThinkingWhenHistoryEchoesIt(t *testing.T) {
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":64,
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"tools":[{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],
+		"messages":[
+			{"role":"user","content":"list files"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"need ls","signature":"sig-1"},
+				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.go"}]}
+		]}`)
+
+	got := postToForcedDeepSeek(t, reqBody)
+
+	var want map[string]any
+	if err := json.Unmarshal(reqBody, &want); err != nil {
+		t.Fatal(err)
+	}
+	want["model"] = "deepseek-v4-pro"
+	wantRaw, _ := json.Marshal(want)
+	if canonicalJSON(t, got) != canonicalJSON(t, wantRaw) {
+		t.Fatalf("deepseek body:\n got %s\nwant %s", canonicalJSON(t, got), canonicalJSON(t, wantRaw))
+	}
+}
+
+// Without tools DeepSeek does not require echoed thinking, so the history is
+// forwarded untouched even when an assistant turn has none.
+func TestDeepSeekLeavesThinkingWithoutTools(t *testing.T) {
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":64,
+		"thinking":{"type":"adaptive"},
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"hello"}]},
+			{"role":"user","content":"again"}
+		]}`)
+
+	got := postToForcedDeepSeek(t, reqBody)
+
+	var want map[string]any
+	if err := json.Unmarshal(reqBody, &want); err != nil {
+		t.Fatal(err)
+	}
+	want["model"] = "deepseek-v4-pro"
+	wantRaw, _ := json.Marshal(want)
+	if canonicalJSON(t, got) != canonicalJSON(t, wantRaw) {
+		t.Fatalf("deepseek body:\n got %s\nwant %s", canonicalJSON(t, got), canonicalJSON(t, wantRaw))
+	}
+}
+
 func TestDeepSeekTierSkippedWhenNoKey(t *testing.T) {
 	f := &fakeUpstreams{}
 	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
