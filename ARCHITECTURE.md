@@ -122,7 +122,10 @@ failed GLM, or the primary failover when `failover_provider = "deepseek"`. It
 rewrites the model and drops the
 `Artifact` tool (DeepSeek's validator rejects its schema; if that was the only
 tool, the `tools` key is omitted). This is the one place the tool list is not
-forwarded verbatim, and it applies in every mode.
+forwarded verbatim, and it applies in every mode. It also disables thinking and
+drops `thinking`/`redacted_thinking` blocks when a tool-bearing request has an
+assistant turn without echoed thinking, which DeepSeek's thinking mode would
+otherwise reject with 400.
 
 **`writeUpstream`** streams the response to the client with `X-Conduit-Provider`
 set. On the *first* reply after a failover it injects a chat notice

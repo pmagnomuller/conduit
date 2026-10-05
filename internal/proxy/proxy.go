@@ -1022,7 +1022,8 @@ func rewriteModel(body []byte, newModel string) ([]byte, error) {
 // Dropping Artifact is a deliberate deviation from pure model rewriting, and it
 // applies on every path into this tier (auto failover, pinned deepseek, and a
 // jev pick) — not just jev. The alternative is a 400 that fails the whole tier.
-// No other tool is touched.
+// No other tool is touched. Thinking is normalised the same way, for the same
+// reason; see disableUnechoedThinking.
 func prepareDeepSeekBody(body []byte, model string) []byte {
 	if len(body) == 0 {
 		return body
@@ -1043,9 +1044,120 @@ func prepareDeepSeekBody(body []byte, model string) []byte {
 			obj["tools"] = trimmed
 		}
 	}
+	disableUnechoedThinking(obj)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
+	}
+	return out
+}
+
+// disableUnechoedThinking turns DeepSeek's thinking mode off for a request its
+// validator would reject. DeepSeek thinks by default, and when a request
+// carries tools it 400s ("The `content[].thinking` in the thinking mode must be
+// passed back to the API") unless every prior assistant turn echoes a thinking
+// block. Claude Code histories routinely break that: turns served by Anthropic
+// with adaptive thinking that chose not to think, redacted_thinking (which
+// DeepSeek does not support), and turns served by GLM.
+//
+// Thinking cannot be echoed for those turns without inventing it, so the
+// request is sent as a plain non-thinking one: thinking set to disabled and the
+// thinking/redacted_thinking blocks dropped from history. A history that
+// already satisfies the rule, a request without tools, and a client that
+// disabled thinking itself are left untouched.
+func disableUnechoedThinking(obj map[string]json.RawMessage) {
+	if !hasTools(obj["tools"]) || thinkingDisabled(obj["thinking"]) {
+		return
+	}
+	var msgs []map[string]json.RawMessage
+	if err := json.Unmarshal(obj["messages"], &msgs); err != nil {
+		return
+	}
+	echoed := true
+	for _, m := range msgs {
+		if messageRole(m) == "assistant" && !echoesThinking(m["content"]) {
+			echoed = false
+			break
+		}
+	}
+	if echoed {
+		return
+	}
+	for _, m := range msgs {
+		if stripped := stripThinkingBlocks(m["content"]); stripped != nil {
+			m["content"] = stripped
+		}
+	}
+	rawMsgs, err := json.Marshal(msgs)
+	if err != nil {
+		return
+	}
+	obj["messages"] = rawMsgs
+	obj["thinking"] = json.RawMessage(`{"type":"disabled"}`)
+}
+
+func hasTools(raw json.RawMessage) bool {
+	var tools []json.RawMessage
+	return json.Unmarshal(raw, &tools) == nil && len(tools) > 0
+}
+
+func thinkingDisabled(raw json.RawMessage) bool {
+	var t struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(raw, &t) == nil && t.Type == "disabled"
+}
+
+func messageRole(m map[string]json.RawMessage) string {
+	var role string
+	_ = json.Unmarshal(m["role"], &role)
+	return role
+}
+
+// echoesThinking reports whether an assistant turn carries a non-empty
+// thinking block. String content and an empty thinking text both count as not
+// echoed.
+func echoesThinking(content json.RawMessage) bool {
+	var blocks []struct {
+		Type     string `json:"type"`
+		Thinking string `json:"thinking"`
+	}
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Type == "thinking" && b.Thinking != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// stripThinkingBlocks returns content without thinking and redacted_thinking
+// blocks, or nil when there is nothing to strip or stripping would leave the
+// turn empty (an empty content list is invalid, so that turn is kept as is).
+func stripThinkingBlocks(content json.RawMessage) json.RawMessage {
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return nil
+	}
+	kept := make([]json.RawMessage, 0, len(blocks))
+	for _, b := range blocks {
+		var head struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(b, &head)
+		if head.Type == "thinking" || head.Type == "redacted_thinking" {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	if len(kept) == len(blocks) || len(kept) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return nil
 	}
 	return out
 }
