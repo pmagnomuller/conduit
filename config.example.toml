@@ -102,14 +102,22 @@ min_margin = 0.15
 restrict_sensitive = true
 restricted_providers = ["glm", "deepseek"]
 # restricted_patterns = ['\.env\b', '\.ssh/']
+# Local complexity classifier: each call is scored light/standard/heavy and
+# the candidates are filtered to that tier's band before Jev is asked; a Jev
+# failure falls to the band's top model instead of plain auto. false
+# reproduces the pre-classifier behaviour exactly.
+classifier = true
 
 # Candidate catalog. Omit to use the built-in default (opus/sonnet/haiku,
 # glm-5.3, glm-5.3-flash, deepseek-v4-flash). Defining any entry replaces
 # the whole default list. `profile` is the prior Jev reads when choosing.
+# `tier` bands the candidate for the classifier (light|standard|heavy);
+# blank inherits the built-in catalog's tier by model, else standard.
 # [[jev.catalog]]
 # provider = "anthropic"
 # model = "claude-sonnet-5"
 # profile = "Strong general implementation: cross-file refactors, feature work with clear requirements."
+# tier = "standard"
 #
 # [[jev.catalog]]
 # provider = "glm"

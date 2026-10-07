@@ -111,6 +111,13 @@ type JevConfig struct {
 	RestrictedProviders []string    `toml:"restricted_providers"`
 	RestrictedPatterns  []string    `toml:"restricted_patterns"` // regexps; nil → DefaultRestrictedPatterns
 	Catalog             []Candidate `toml:"catalog"`
+	// Classifier enables the local complexity classifier: each call is
+	// scored into light/standard/heavy, the candidates are filtered to that
+	// tier's band before Jev is asked, and a Jev failure falls to the band's
+	// top model instead of plain auto. Defaults to true; an explicit
+	// classifier = false in TOML is honoured, because Load unmarshals onto
+	// the Default() value and go-toml leaves absent fields untouched.
+	Classifier bool `toml:"classifier"`
 }
 
 // Switch-cost defaults; see JevConfig.
@@ -147,6 +154,10 @@ type Candidate struct {
 	PriceIn        float64 `json:"price_in,omitempty"         toml:"price_in"`
 	PriceOut       float64 `json:"price_out,omitempty"        toml:"price_out"`
 	PriceCacheRead float64 `json:"price_cache_read,omitempty" toml:"price_cache_read"`
+	// Tier bands the candidate for the complexity classifier: "light",
+	// "standard" or "heavy". A catalog override with a blank tier inherits
+	// the default catalog's tier by key, then "standard".
+	Tier string `json:"tier,omitempty" toml:"tier"`
 }
 
 // Key is the catalog key sent to Jev, e.g. "anthropic/claude-opus-5".
@@ -161,24 +172,45 @@ func (c Candidate) Key() string { return c.Provider + "/" + c.Model }
 // answer 200 while a weaker model serves the request (see the alias issue).
 func DefaultCatalog() []Candidate {
 	return []Candidate{
-		{Provider: "anthropic", Model: "claude-fable-5-1", PriceIn: 10, PriceOut: 50, PriceCacheRead: 0.25,
+		{Provider: "anthropic", Model: "claude-fable-5-1", Tier: "heavy", PriceIn: 10, PriceOut: 50, PriceCacheRead: 0.25,
 			Profile: "Strongest available. Long-horizon agentic work, hard architecture, gnarly debugging, security or concurrency review, anything where a wrong call is costly to undo."},
-		{Provider: "anthropic", Model: "claude-opus-5-5", PriceIn: 4, PriceOut: 20, PriceCacheRead: 0.20,
+		{Provider: "anthropic", Model: "claude-opus-5-5", Tier: "heavy", PriceIn: 4, PriceOut: 20, PriceCacheRead: 0.20,
 			Profile: "Frontier reasoning and coding, second only to fable-5-1. Ambiguous broad tasks, multi-file design, subtle correctness. Thinking always on; effort defaults to medium."},
-		{Provider: "anthropic", Model: "claude-opus-5", PriceIn: 5, PriceOut: 25, PriceCacheRead: 0.50,
+		{Provider: "anthropic", Model: "claude-opus-5", Tier: "heavy", PriceIn: 5, PriceOut: 25, PriceCacheRead: 0.50,
 			Profile: "Previous Opus generation. Same class of work as opus-5-5 when that tier is unavailable."},
-		{Provider: "anthropic", Model: "claude-sonnet-5", PriceIn: 2, PriceOut: 10, PriceCacheRead: 0.20,
+		{Provider: "anthropic", Model: "claude-sonnet-5", Tier: "standard", PriceIn: 2, PriceOut: 10, PriceCacheRead: 0.20,
 			Profile: "Strong general implementation: cross-file refactors, feature work with clear requirements, robust tests."},
-		{Provider: "anthropic", Model: "claude-haiku-4-5", PriceIn: 1, PriceOut: 5, PriceCacheRead: 0.10,
+		{Provider: "anthropic", Model: "claude-haiku-4-5", Tier: "light", PriceIn: 1, PriceOut: 5, PriceCacheRead: 0.10,
 			Profile: "Light, fast work only: a title, a summary, one mechanical edit with a known target, a trivial tool continuation."},
-		{Provider: "glm", Model: "glm-5.3", PriceIn: 1.40, PriceOut: 4.40, PriceCacheRead: 0.26,
+		{Provider: "glm", Model: "glm-5.3", Tier: "standard", PriceIn: 1.40, PriceOut: 4.40, PriceCacheRead: 0.26,
 			Profile: "Capable coding model off the Claude plan: bounded implementation with clear requirements and known patterns."},
-		{Provider: "glm", Model: "glm-5.3-flash", PriceIn: 0.15, PriceOut: 0.50, PriceCacheRead: 0.03,
+		{Provider: "glm", Model: "glm-5.3-flash", Tier: "light", PriceIn: 0.15, PriceOut: 0.50, PriceCacheRead: 0.03,
 			Profile: "Lighter GLM tier: mechanical follow-through, formatting, simple tool continuations."},
-		{Provider: "deepseek", Model: "deepseek-v4-pro", PriceIn: 1.32, PriceOut: 3.96, PriceCacheRead: 0.044,
+		{Provider: "deepseek", Model: "deepseek-v4-pro", Tier: "standard", PriceIn: 1.32, PriceOut: 3.96, PriceCacheRead: 0.044,
 			Profile: "Strongest DeepSeek tier: reasoning-heavy implementation and debugging. Needs DEEPSEEK_API_KEY."},
-		{Provider: "deepseek", Model: "deepseek-v4-flash", PriceIn: 0.30, PriceOut: 1.20, PriceCacheRead: 0.006,
+		{Provider: "deepseek", Model: "deepseek-v4-flash", Tier: "light", PriceIn: 0.30, PriceOut: 1.20, PriceCacheRead: 0.006,
 			Profile: "Cheapest tier, bounded mechanical work only. Needs DEEPSEEK_API_KEY. The retired ids deepseek-chat and deepseek-reasoner are aliases to this model, not stronger tiers."},
+	}
+}
+
+// inheritTiers fills blank tiers of a catalog override from the default
+// catalog by key, so an override that only retunes profiles or prices keeps
+// the built-in banding; keys the default catalog does not know land in the
+// thin-evidence fallback tier, "standard".
+func inheritTiers(cands []Candidate) {
+	def := map[string]string{}
+	for _, c := range DefaultCatalog() {
+		def[c.Key()] = c.Tier
+	}
+	for i, c := range cands {
+		if c.Tier != "" {
+			continue
+		}
+		if t := def[c.Key()]; t != "" {
+			cands[i].Tier = t
+			continue
+		}
+		cands[i].Tier = "standard"
 	}
 }
 
@@ -233,6 +265,9 @@ func Default() Config {
 			TimeoutMS:       4000,
 			LeaseTTLSeconds: 600,
 			DecisionsPath:   "~/.local/state/conduit/decisions.jsonl",
+			// The complexity classifier is on unless the operator opts out;
+			// go-toml leaves this true when the TOML file omits the key.
+			Classifier: true,
 			// GLM (z.ai) and DeepSeek are third-party endpoints whose data
 			// handling we do not control; secret-adjacent turns skip them.
 			RestrictSensitive:   true,
@@ -311,6 +346,8 @@ func Load(path string) (Config, error) {
 	cfg.TypeSafeAPIKey = os.Getenv(tsKeyEnv)
 	if len(cfg.Jev.Catalog) == 0 {
 		cfg.Jev.Catalog = DefaultCatalog()
+	} else {
+		inheritTiers(cfg.Jev.Catalog)
 	}
 	if cfg.Jev.TimeoutMS <= 0 {
 		cfg.Jev.TimeoutMS = 4000

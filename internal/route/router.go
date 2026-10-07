@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +26,7 @@ type Decision struct {
 	Model          string    `json:"model"`
 	Step           string    `json:"step"`             // user_turn|tool_step|other
 	Lease          string    `json:"lease"`            // one_call|tool_chain|user_turn
-	Source         string    `json:"source"`           // jev|lease|sticky|low_confidence|fail_open
+	Source         string    `json:"source"`           // jev|lease|sticky|low_confidence|tier|fail_open
 	Reason         string    `json:"reason,omitempty"` // error text on fail_open, redacted
 	Confidence     float64   `json:"confidence,omitempty"`
 	Margin         float64   `json:"margin,omitempty"` // Jev's p(top)−p(second), when given
@@ -33,6 +34,11 @@ type Decision struct {
 	Pick string `json:"pick,omitempty"`
 	// Policy is "restricted" when sensitive content limited the candidates.
 	Policy string `json:"policy,omitempty"`
+	// Tier is the complexity tier the local classifier placed this call in,
+	// and TierEvidence the classifier's fired-signal count. Set on every
+	// decision while the classifier is enabled; empty otherwise.
+	Tier         string `json:"tier,omitempty"`
+	TierEvidence int    `json:"tier_evidence,omitempty"`
 	// EstInputUSD prices this call's input on the chosen model (cache-read
 	// rate when it stays on a warm model); BaselineInputUSD the same call on
 	// the requested model, as auto would have sent it. Input only: output
@@ -52,6 +58,9 @@ const (
 	// SourceLowConfidence: Jev's top two picks were too close to call, so the
 	// thread stayed on its model.
 	SourceLowConfidence = "low_confidence"
+	// SourceTier: Jev failed while the classifier was on, so the call went to
+	// the deterministic top of the classified band instead of plain auto.
+	SourceTier = "tier"
 
 	// cacheWarmWindow approximates the provider prompt-cache TTL (Anthropic's
 	// default is five minutes); a thread served within it is cache-warm.
@@ -199,6 +208,23 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		return r.failOpen(start, dossier, reason), false
 	}
 
+	// The tier is classified before fillCurrent and the lease check so that
+	// every later step — lease reuse included — can record it. The tier never
+	// overrides either guard: it only narrows what Jev is offered.
+	var tier string
+	var evidence int
+	if r.cfg.Classifier {
+		var reasons []string
+		tier, evidence, reasons = classify(dossier)
+		dossier.ComplexityTier = tier
+		dossier.ComplexityEvidence = evidence
+		r.log.Debug("jev complexity tier", "tier", tier, "evidence", evidence, "reasons", strings.Join(reasons, "; "))
+	}
+
+	// fillCurrent runs against the pre-band candidate list on purpose: the
+	// thread's Current and CacheWarm must survive a band that excludes the
+	// current model, or the switch-cost guards below would silently disable
+	// themselves whenever the tier changed.
 	r.fillCurrent(&dossier, candidates, start)
 
 	if ld, reused := r.reuseLease(dossier, candidates, start); reused {
@@ -209,11 +235,28 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		ld.Reason = ""
 		ld.Pick, ld.Margin = "", 0
 		ld.Policy = policyOf(dossier)
+		ld.Tier, ld.TierEvidence = tier, evidence
 		r.priceDecision(&ld, dossier)
 		ld.LatencyMS = r.now().Sub(start).Milliseconds()
 		r.remember(dossier, ld, start)
 		r.record(ld)
 		return ld, true
+	}
+
+	// The band filter runs after the lease check: a lease crossing tiers
+	// holds. Widening only ever narrows the caller's slice.
+	offered := candidates
+	var bandNote string
+	if tier != "" {
+		var effective string
+		var widened bool
+		offered, effective, widened = band(candidates, tier)
+		if len(offered) == 0 {
+			return r.failOpen(start, dossier, "no candidate in tier "+tier), false
+		}
+		if widened {
+			bandNote = clipHead("tier "+tier+" empty; widened to "+effective, maxErrBody)
+		}
 	}
 
 	if ctx == nil {
@@ -222,9 +265,38 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	res, err := r.client.ask(ctx, dossier, candidates)
+	res, err := r.client.ask(ctx, dossier, offered)
 	if err != nil {
-		return r.failOpen(start, dossier, err.Error()), false
+		if tier == "" {
+			return r.failOpen(start, dossier, err.Error()), false
+		}
+		// Tier failover: with the classifier on, a Jev failure falls to the
+		// deterministic top of the (possibly widened) band rather than plain
+		// auto. The band is non-empty here, and its first member is its
+		// top-ranked candidate because the caller's order is rank order.
+		provider, model := splitKey(offered[0].Key())
+		reason := clipHead(redact.String(err.Error()), maxErrBody)
+		if bandNote != "" {
+			reason = bandNote + "; " + reason
+		}
+		d = Decision{
+			At:             start,
+			RequestedModel: dossier.RequestedModel,
+			Provider:       provider,
+			Model:          model,
+			Step:           dossier.Step,
+			Lease:          LeaseOneCall,
+			Source:         SourceTier,
+			Reason:         reason,
+			Policy:         policyOf(dossier),
+			Tier:           tier,
+			TierEvidence:   evidence,
+			LatencyMS:      r.now().Sub(start).Milliseconds(),
+		}
+		r.priceDecision(&d, dossier)
+		r.remember(dossier, d, start)
+		r.record(d)
+		return d, true
 	}
 	choice, source := r.applySwitchPolicy(dossier, res)
 	provider, model := splitKey(choice)
@@ -236,9 +308,12 @@ func (r *Router) Decide(ctx context.Context, body []byte, candidates []Candidate
 		Step:           dossier.Step,
 		Lease:          res.Lease,
 		Source:         source,
+		Reason:         bandNote,
 		Confidence:     res.Confidence,
 		Margin:         res.Margin,
 		Policy:         policyOf(dossier),
+		Tier:           tier,
+		TierEvidence:   evidence,
 		LatencyMS:      r.now().Sub(start).Milliseconds(),
 	}
 	if source != SourceJev {
@@ -375,6 +450,8 @@ func (r *Router) failOpen(start time.Time, d Dossier, reason string) Decision {
 		Source:         SourceFailOpen,
 		Reason:         redact.String(reason),
 		Policy:         policyOf(d),
+		Tier:           d.ComplexityTier,
+		TierEvidence:   d.ComplexityEvidence,
 		LatencyMS:      r.now().Sub(start).Milliseconds(),
 	}
 	r.record(dec)

@@ -95,7 +95,7 @@ breaker is OPEN and minus `deepseek/*` when no key is set. The router then
 either reuses a lease, asks Jev, or fails open (§4). A successful decision is
 served on the chosen provider with `model` rewritten to the pick — including
 on the Anthropic path when Jev chose a different Claude model. The response
-carries `X-Conduit-Decision: jev|lease|sticky|low_confidence|fail_open`.
+carries `X-Conduit-Decision: jev|lease|sticky|low_confidence|tier|fail_open`.
 
 ### 2.5 The provider functions
 
@@ -289,7 +289,27 @@ failure yields `ok=false`; the proxy then serves the request exactly as
 Every decision — including fail-open — goes to an in-memory ring (200, shown as
 `jev.recent` in the UI) and is appended to `decisions.jsonl` (mode 0600,
 rotated at 4 MiB to `decisions.jsonl.1`). Fields are the already-clipped
-dossier values plus provider, model, lease, source, confidence, margin, pick, policy, est/baseline input cost, latency.
+dossier values plus provider, model, lease, source, confidence, margin, pick, policy, tier, tier_evidence, est/baseline input cost, latency.
+
+### 4.9 Complexity tiers (the local classifier)
+
+With `classifier = true` (the default) each call is first scored by a pure
+local classifier (`tier.go`) into `light` / `standard` / `heavy` from the
+dossier's thinking budget, tool errors, task keywords, tool-set width and
+shape — never from context size, which is switch cost, not authoring
+difficulty. Each catalog candidate carries a `tier`; the candidates are
+filtered to the call's tier band (widening heavy→standard→light,
+light→standard, standard→heavy-then-light when a band is empty after the
+breaker/key/restriction filters) and only the band is offered to Jev. Leases
+and the switch-cost guards outrank the tier and are never broken by it —
+`fillCurrent` deliberately runs against the pre-band list so a band change
+cannot silently disable the sticky guard. A Jev failure no longer falls all
+the way open: it routes to the band's top-ranked model with
+`source: "tier"` (failing open only when no band can be formed at all), so a
+restricted turn that Jev answers with an untrusted provider now lands on the
+trusted band's top model instead of `auto`. Every decision records
+`tier` / `tier_evidence`; `classifier = false` restores the pre-classifier
+behaviour exactly.
 
 ---
 

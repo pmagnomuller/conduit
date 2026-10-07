@@ -20,9 +20,9 @@ import (
 )
 
 var testCatalog = []Candidate{
-	{Provider: "anthropic", Model: "claude-opus-5", Profile: "hard"},
-	{Provider: "anthropic", Model: "claude-sonnet-5", Profile: "medium"},
-	{Provider: "glm", Model: "glm-5.3-flash", Profile: "cheap"},
+	{Provider: "anthropic", Model: "claude-opus-5", Profile: "hard", Tier: TierHeavy},
+	{Provider: "anthropic", Model: "claude-sonnet-5", Profile: "medium", Tier: TierStandard},
+	{Provider: "glm", Model: "glm-5.3-flash", Profile: "cheap", Tier: TierLight},
 }
 
 // jevStub serves canned answers and records requests.
@@ -697,13 +697,43 @@ func TestRestrictedDropsUntrustedProviders(t *testing.T) {
 	}
 }
 
-// Jev's answer is untrusted: naming a filtered provider falls open rather
-// than routing secrets to it.
+// Jev's answer is untrusted: naming a filtered provider no longer falls all
+// the way open when the classifier is on. The band is trusted (it was built
+// from the post-restriction candidates), so the call falls to the band's top
+// model — still an anthropic one, still policy "restricted". This is a
+// deliberate behaviour change from the pre-classifier fail_open.
 func TestRestrictedJevCannotRouteAround(t *testing.T) {
-	r, _ := restrictedRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall})
-	d, ok := r.Decide(context.Background(), readStep(t, "/home/u/.ssh/id_ed25519", "-----BEGIN"), testCatalog)
-	if ok || d.Source != SourceFailOpen || d.Policy != PolicyRestricted {
+	r, _ := newTestRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}, func(c *config.JevConfig) {
+		c.Classifier = true
+		c.RestrictSensitive = true
+		c.RestrictedProviders = []string{"glm", "deepseek"}
+		c.RestrictedPatterns = config.DefaultRestrictedPatterns()
+	})
+	// A tool step over an SSH key with a large thinking budget classifies
+	// heavy; the restricted candidates are the two anthropic entries.
+	body := mustJSON(t, map[string]any{
+		"model":    "claude-opus-5",
+		"system":   "sys",
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 16000},
+		"messages": []any{
+			map[string]any{"role": "user", "content": "opening message"},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{
+				"type": "tool_use", "id": "ta", "name": "Read", "input": map[string]any{"file_path": "/home/u/.ssh/id_ed25519"},
+			}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{
+				"type": "tool_result", "tool_use_id": "ta", "content": "-----BEGIN",
+			}}},
+		},
+	})
+	d, ok := r.Decide(context.Background(), body, testCatalog)
+	if !ok || d.Source != SourceTier || d.Policy != PolicyRestricted {
 		t.Fatalf("d=%+v ok=%v", d, ok)
+	}
+	if d.Provider != "anthropic" || d.Model != "claude-opus-5" || d.Tier != TierHeavy {
+		t.Fatalf("must land on the heavy anthropic band top: %+v", d)
+	}
+	if rec := r.Recent(1); len(rec) != 1 || rec[0].Source != SourceTier || rec[0].Policy != PolicyRestricted {
+		t.Fatalf("recent=%+v", rec)
 	}
 }
 
@@ -795,5 +825,221 @@ func TestPriceTableOverride(t *testing.T) {
 	}
 	if p := tbl["x/y"]; p.PriceIn != 1 {
 		t.Fatalf("new entry: %+v", p)
+	}
+}
+
+// tierOn is the mutate shared by the classifier tests below: every one of
+// them runs with the local complexity classifier enabled.
+func tierOn(c *config.JevConfig) { c.Classifier = true }
+
+// thinkingTurn builds a user turn with a thinking budget. first fixes the
+// fingerprint (system + first user message); last is the task text.
+func thinkingTurn(t *testing.T, budget int, first, last string) []byte {
+	t.Helper()
+	return mustJSON(t, map[string]any{
+		"model":    "claude-opus-5",
+		"system":   "sys",
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": budget},
+		"messages": []any{
+			map[string]any{"role": "user", "content": first},
+			map[string]any{"role": "assistant", "content": "ok"},
+			map[string]any{"role": "user", "content": last},
+		},
+	})
+}
+
+// navStep builds a tool step over the given tool names with no user text
+// message, so the fingerprint is system-only and the task stays empty.
+func navStep(t *testing.T, errors int, tools ...string) []byte {
+	t.Helper()
+	var uses, results []any
+	for i, name := range tools {
+		id := "t" + string(rune('a'+i))
+		uses = append(uses, map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}})
+		res := map[string]any{"type": "tool_result", "tool_use_id": id, "content": "ok"}
+		if i < errors {
+			res["is_error"] = true
+		}
+		results = append(results, res)
+	}
+	return mustJSON(t, map[string]any{
+		"model":  "claude-opus-5",
+		"system": "sys",
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": uses},
+			map[string]any{"role": "user", "content": results},
+		},
+	})
+}
+
+// (a) With the classifier on, Jev is offered only the band, the dossier
+// carries the tier, and the decision records it.
+func TestClassifierNarrowsCriteriaAndRecordsTier(t *testing.T) {
+	r, stub := newTestRouter(t, &jevStub{choice: "anthropic/claude-sonnet-5", lease: LeaseOneCall}, tierOn)
+	d, ok := r.Decide(context.Background(), userTurn(t, "hello there"), testCatalog)
+	if !ok || d.Source != SourceJev || d.Model != "claude-sonnet-5" {
+		t.Fatalf("d=%+v ok=%v", d, ok)
+	}
+	if d.Tier != TierStandard || d.TierEvidence != 0 {
+		t.Fatalf("tier not recorded: %+v", d)
+	}
+	req := stub.last.Load()
+	mq := req.Questions["model"]
+	if len(mq.Criteria) != 1 || mq.Criteria["anthropic/claude-sonnet-5"] != "medium" {
+		t.Fatalf("criteria must be the standard band only: %v", mq.Criteria)
+	}
+	if req.State.ComplexityTier != TierStandard {
+		t.Fatalf("state=%+v", req.State)
+	}
+	if mq.Instructions == modelInstructions {
+		t.Fatal("classified call must get tier-conditional instructions")
+	}
+}
+
+// (b) A heavy call whose band was filtered away widens to standard, and the
+// decision's reason says so.
+func TestTierWidensWhenBandFilteredOut(t *testing.T) {
+	// Breaker OPEN dropped the heavy opus-5; sonnet-5 and glm remain.
+	r, _ := newTestRouter(t, &jevStub{choice: "anthropic/claude-sonnet-5", lease: LeaseOneCall}, tierOn)
+	d, ok := r.Decide(context.Background(), thinkingTurn(t, 16000, "f", "why does this deadlock happen"), testCatalog[1:])
+	if !ok || d.Source != SourceJev || d.Model != "claude-sonnet-5" || d.Tier != TierHeavy {
+		t.Fatalf("d=%+v ok=%v", d, ok)
+	}
+	if !strings.Contains(d.Reason, "widen") || !strings.Contains(d.Reason, TierStandard) {
+		t.Fatalf("reason must note the widening: %q", d.Reason)
+	}
+}
+
+// (c) A Jev failure with the classifier on falls to the top-ranked member
+// of the band, not to plain auto. The default catalog orders strongest
+// first, so a heavy call lands on fable.
+func TestJevErrorFallsToTierTop(t *testing.T) {
+	r, _ := newTestRouter(t, &jevStub{status: 500}, tierOn)
+	d, ok := r.Decide(context.Background(), thinkingTurn(t, 16000, "f", "why does this deadlock happen"), config.DefaultCatalog())
+	if !ok || d.Source != SourceTier {
+		t.Fatalf("d=%+v ok=%v", d, ok)
+	}
+	if d.Provider != "anthropic" || d.Model != "claude-fable-5-1" || d.Tier != TierHeavy {
+		t.Fatalf("must land on the band top: %+v", d)
+	}
+	if !strings.Contains(d.Reason, "status 500") {
+		t.Fatalf("the jev error must stay observable: %q", d.Reason)
+	}
+	if rec := r.Recent(1); len(rec) != 1 || rec[0].Source != SourceTier || rec[0].Model != "claude-fable-5-1" {
+		t.Fatalf("recent=%+v", rec)
+	}
+}
+
+// (d) A degenerate catalog (no candidate carries a known tier) cannot form
+// a band even after widening, so the call fails open without asking Jev.
+func TestTierDegenerateCatalogFailsOpen(t *testing.T) {
+	untiered := []Candidate{
+		{Provider: "anthropic", Model: "claude-opus-5", Profile: "hard"},
+		{Provider: "glm", Model: "glm-5.3-flash", Profile: "cheap"},
+	}
+	r, stub := newTestRouter(t, &jevStub{choice: "anthropic/claude-opus-5"}, tierOn)
+	d, ok := r.Decide(context.Background(), userTurn(t, "hello there"), untiered)
+	if ok || d.Source != SourceFailOpen {
+		t.Fatalf("d=%+v ok=%v", d, ok)
+	}
+	if stub.calls.Load() != 0 {
+		t.Fatalf("jev calls=%d", stub.calls.Load())
+	}
+}
+
+// (e) A lease crossing tiers holds: a light tool chain keeps serving on the
+// light model even when the chain escalates into errors and goes heavy.
+func TestLeaseHoldsAcrossTierChange(t *testing.T) {
+	r, stub := newTestRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseToolChain}, tierOn)
+	// Empty task, two messages, a single Read: short (-2) plus navigation
+	// (-1) classifies light.
+	d1, ok := r.Decide(context.Background(), navStep(t, 0, "Read"), testCatalog)
+	if !ok || d1.Source != SourceJev || d1.Provider != "glm" || d1.Tier != TierLight {
+		t.Fatalf("d1=%+v", d1)
+	}
+	// Same fingerprint (system-only), same tool set, but two Read errors and
+	// a large thinking budget: the call is now heavy.
+	esc := mustJSON(t, map[string]any{
+		"model":    "claude-opus-5",
+		"system":   "sys",
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 16000},
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "ta", "name": "Read", "input": map[string]any{}},
+				map[string]any{"type": "tool_use", "id": "tb", "name": "Read", "input": map[string]any{}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "ta", "is_error": true, "content": "boom"},
+				map[string]any{"type": "tool_result", "tool_use_id": "tb", "is_error": true, "content": "boom"},
+			}},
+		},
+	})
+	d2, ok := r.Decide(context.Background(), esc, testCatalog)
+	if !ok || d2.Source != SourceLease || d2.Provider != "glm" || d2.Model != "glm-5.3-flash" {
+		t.Fatalf("lease must hold across the tier change: %+v", d2)
+	}
+	if d2.Tier != TierHeavy {
+		t.Fatalf("the escalated call still records its own tier: %+v", d2)
+	}
+	if stub.calls.Load() != 1 {
+		t.Fatalf("jev calls=%d", stub.calls.Load())
+	}
+}
+
+// (f)+(g) The sticky guard outranks the tier, and fillCurrent runs against
+// the pre-band list so Current survives a band that excludes it.
+func TestStickyOutranksTierAndCurrentSurvivesBand(t *testing.T) {
+	stub := &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}
+	r, _ := newTestRouter(t, stub, func(c *config.JevConfig) {
+		tierOn(c)
+		c.MaxSwitchContext = 10
+	})
+	// Single short light-keyword message: light.
+	light := mustJSON(t, map[string]any{
+		"model":    "claude-opus-5",
+		"system":   "sys",
+		"messages": []any{map[string]any{"role": "user", "content": "bump the version"}},
+	})
+	d1, ok := r.Decide(context.Background(), light, testCatalog)
+	if !ok || d1.Source != SourceJev || d1.Provider != "glm" || d1.Tier != TierLight {
+		t.Fatalf("d1=%+v", d1)
+	}
+	// Same fingerprint; the new turn is heavy (thinking + heavy keywords).
+	stub.choice, stub.conf = "anthropic/claude-opus-5", 0.5
+	heavy := thinkingTurn(t, 16000, "bump the version", "why does this deadlock happen")
+	d2, ok := r.Decide(context.Background(), heavy, testCatalog)
+	if !ok || d2.Source != SourceSticky || d2.Provider != "glm" || d2.Model != "glm-5.3-flash" {
+		t.Fatalf("sticky must outrank the tier: %+v", d2)
+	}
+	if d2.Tier != TierHeavy || d2.Pick != "anthropic/claude-opus-5" {
+		t.Fatalf("tier and pick must both record: %+v", d2)
+	}
+	// fillCurrent ran before the band filter: glm-5.3-flash is out of the
+	// heavy band yet was still reported as the thread's current model.
+	if cur := stub.last.Load().State.Current; cur != "glm/glm-5.3-flash" {
+		t.Fatalf("current=%q", cur)
+	}
+}
+
+// (i) classifier=false keeps the pre-classifier behaviour: the full catalog
+// is offered, the dossier carries no tier, and a Jev error fails open.
+func TestClassifierDisabledKeepsLegacyBehavior(t *testing.T) {
+	r, stub := newTestRouter(t, &jevStub{choice: "glm/glm-5.3-flash", lease: LeaseOneCall}, nil)
+	d, ok := r.Decide(context.Background(), userTurn(t, "x"), testCatalog)
+	if !ok || d.Source != SourceJev || d.Tier != "" {
+		t.Fatalf("d=%+v", d)
+	}
+	mq := stub.last.Load().Questions["model"]
+	if len(mq.Criteria) != 3 || mq.Instructions != modelInstructions {
+		t.Fatalf("criteria=%v", mq.Criteria)
+	}
+	if stub.last.Load().State.ComplexityTier != "" {
+		t.Fatal("state must not carry a tier with the classifier off")
+	}
+
+	r2, _ := newTestRouter(t, &jevStub{status: 500}, nil)
+	d2, ok := r2.Decide(context.Background(), userTurn(t, "x"), testCatalog)
+	if ok || d2.Source != SourceFailOpen || d2.Tier != "" {
+		t.Fatalf("d2=%+v ok=%v", d2, ok)
 	}
 }
