@@ -444,7 +444,7 @@ function renderJev(jev) {
     var conf = typeof d.confidence === 'number' ? Math.max(0, Math.min(1, d.confidence)) : 0;
     var pct = Math.round(conf * 100);
     var lat = typeof d.latency_ms === 'number' ? d.latency_ms + 'ms' : '—';
-    var why = [d.reason, d.pick ? 'Jev picked ' + d.pick : '', d.policy ? 'policy: ' + d.policy : '']
+    var why = [d.tier ? 'tier: ' + d.tier : '', d.reason, d.pick ? 'Jev picked ' + d.pick : '', d.policy ? 'policy: ' + d.policy : '']
       .filter(Boolean).join(' · ');
     var reason = why ? ' title="' + esc(why) + '"' : '';
     return '<div class="dec">' +

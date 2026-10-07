@@ -280,6 +280,97 @@ func TestCandidateKey(t *testing.T) {
 	}
 }
 
+// The classifier defaults to on, and an explicit false in TOML survives
+// Load because go-toml leaves fields the file omits untouched.
+func TestJevClassifierDefaultAndExplicitFalse(t *testing.T) {
+	t.Setenv("ZAI_API_KEY", "k")
+	if !config.Default().Jev.Classifier {
+		t.Fatal("Default() must enable the classifier")
+	}
+	cfg, err := config.Load(writeCfg(t, "listen = \"127.0.0.1:8787\"\n[jev]\ntimeout_ms = 100\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Jev.Classifier {
+		t.Fatal("absent classifier key must stay true")
+	}
+	cfg, err = config.Load(writeCfg(t, "listen = \"127.0.0.1:8787\"\n[jev]\nclassifier = false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Jev.Classifier {
+		t.Fatal("explicit classifier = false must be honoured")
+	}
+}
+
+func TestDefaultCatalogTiers(t *testing.T) {
+	for _, c := range config.DefaultCatalog() {
+		switch c.Tier {
+		case "light", "standard", "heavy":
+		default:
+			t.Fatalf("%s has tier %q", c.Key(), c.Tier)
+		}
+	}
+	byKey := map[string]string{}
+	for _, c := range config.DefaultCatalog() {
+		byKey[c.Key()] = c.Tier
+	}
+	for key, want := range map[string]string{
+		"anthropic/claude-fable-5-1": "heavy",
+		"anthropic/claude-haiku-4-5": "light",
+		"glm/glm-5.3":                "standard",
+		"deepseek/deepseek-v4-flash": "light",
+	} {
+		if byKey[key] != want {
+			t.Fatalf("%s tier=%q want %q", key, byKey[key], want)
+		}
+	}
+}
+
+func TestJevCatalogTierInheritance(t *testing.T) {
+	t.Setenv("ZAI_API_KEY", "k")
+	path := writeCfg(t, `listen = "127.0.0.1:8787"
+
+[[jev.catalog]]
+provider = "glm"
+model = "glm-5.3"
+profile = "bounded"
+
+[[jev.catalog]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+profile = "tiny"
+
+[[jev.catalog]]
+provider = "anthropic"
+model = "claude-fable-9"
+profile = "unknown id"
+
+[[jev.catalog]]
+provider = "deepseek"
+model = "deepseek-v4-pro"
+profile = "explicit"
+tier = "heavy"
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := cfg.Jev.Catalog
+	if len(cat) != 4 {
+		t.Fatalf("catalog=%+v", cat)
+	}
+	if cat[0].Tier != "standard" || cat[1].Tier != "light" {
+		t.Fatalf("blank tiers must inherit by key: %+v", cat)
+	}
+	if cat[2].Tier != "standard" {
+		t.Fatalf("unknown key must fall back to standard: %+v", cat)
+	}
+	if cat[3].Tier != "heavy" {
+		t.Fatalf("explicit tier must be kept: %+v", cat)
+	}
+}
+
 func TestEnvFileValuesReachApplyEnv(t *testing.T) {
 	t.Setenv("ZAI_API_KEY", "k")
 	t.Setenv("CONDUIT_JEV_TIMEOUT_MS", "")

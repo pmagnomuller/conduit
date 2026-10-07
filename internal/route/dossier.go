@@ -56,6 +56,11 @@ type Dossier struct {
 	// Filled by the router, not by Extract.
 	Current   string `json:"current,omitempty"`
 	CacheWarm bool   `json:"cache_warm,omitempty"`
+	// ComplexityTier is the band the router's local classifier placed this
+	// call in, and ComplexityEvidence the classifier's fired-signal count.
+	// Filled by the router, not by Extract; empty when the classifier is off.
+	ComplexityTier     string `json:"complexity_tier,omitempty"`
+	ComplexityEvidence int    `json:"complexity_evidence,omitempty"`
 	// Sensitive marks a call whose recent messages reference secret material;
 	// the router has already limited the candidates to trusted providers.
 	Sensitive bool `json:"sensitive,omitempty"`
