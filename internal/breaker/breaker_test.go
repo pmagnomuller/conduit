@@ -136,7 +136,7 @@ func TestRoutingModeInvariantsAndPersistence(t *testing.T) {
 	if !found {
 		t.Fatalf("missing ROUTE MODE log: %v", logs)
 	}
-	if snap := br.Snapshot(); snap.Mode != "jev" {
+	if snap := br.Snapshot(time.Now()); snap.Mode != "jev" {
 		t.Fatalf("snapshot mode=%q", snap.Mode)
 	}
 
@@ -272,5 +272,37 @@ func TestStateWithoutProbesIsReadOnly(t *testing.T) {
 	}
 	if len(logs) != 1 || !strings.HasPrefix(logs[0], "BREAKER OPEN") {
 		t.Fatalf("State logged something beyond the Open itself: %v", logs)
+	}
+}
+
+// An OPEN entry past its window for a model nobody requests again must not
+// keep reporting the failover tier or show up as open.
+func TestExpiredOpenNotReported(t *testing.T) {
+	br := breaker.New(filepath.Join(t.TempDir(), "state.json"), 5*time.Minute, true, nil)
+	br.SetFailoverProvider("deepseek")
+	now := time.Now()
+	until := now.Add(5 * time.Minute)
+	br.Open("anthropic", "claude-fable-5-1", "rate_limit_error", until, now)
+
+	if got := br.RoutingProvider(now); got != "deepseek" {
+		t.Fatalf("routing while open=%s", got)
+	}
+	if _, ok := br.Snapshot(now).Entries[breaker.Key("anthropic", "claude-fable-5-1")]; !ok {
+		t.Fatal("open entry missing from snapshot")
+	}
+
+	later := until.Add(time.Hour)
+	if got := br.RoutingProvider(later); got != "anthropic" {
+		t.Fatalf("routing after expiry=%s", got)
+	}
+	if n := len(br.Snapshot(later).Entries); n != 0 {
+		t.Fatalf("snapshot after expiry has %d entries", n)
+	}
+	// The request path still resolves the window.
+	if st := br.Decide("anthropic", "claude-fable-5-1", later); st != breaker.Probe {
+		t.Fatalf("decide after expiry=%s", st)
+	}
+	if got := br.RoutingProvider(later); got != "probe" {
+		t.Fatalf("routing during probe=%s", got)
 	}
 }

@@ -153,7 +153,7 @@ func (b *Breaker) Decide(upstream, model string, now time.Time) State {
 	}
 	switch e.State {
 	case Open:
-		if !e.Until.IsZero() && !now.Before(e.Until) {
+		if expired(e, now) {
 			if b.probeOn {
 				e.State = Probe
 				e.LastChange = now
@@ -190,9 +190,15 @@ func (b *Breaker) State(upstream, model string, now time.Time) State {
 	if !ok {
 		return Closed
 	}
+	return b.effective(e, now)
+}
+
+// effective is the window logic shared by State and the read-only views: an
+// OPEN entry past its window is PROBE when probes are on, CLOSED otherwise.
+func (b *Breaker) effective(e Entry, now time.Time) State {
 	switch e.State {
 	case Open:
-		if !e.Until.IsZero() && !now.Before(e.Until) {
+		if expired(e, now) {
 			if b.probeOn {
 				return Probe
 			}
@@ -204,6 +210,10 @@ func (b *Breaker) State(upstream, model string, now time.Time) State {
 	default:
 		return Closed
 	}
+}
+
+func expired(e Entry, now time.Time) bool {
+	return e.State == Open && !e.Until.IsZero() && !now.Before(e.Until)
 }
 
 // Open sets the breaker to OPEN. Returns true if this call newly transitioned
@@ -255,12 +265,18 @@ func (b *Breaker) ReOpenFromProbe(upstream, model, reason string, until time.Tim
 }
 
 // RoutingProvider returns a coarse hint for UIs: the failover provider if any
-// entry is OPEN, "probe" if any is PROBE and none OPEN, otherwise "anthropic".
-func (b *Breaker) RoutingProvider() string {
+// entry is OPEN, "probe" if a probe is in flight and none OPEN, otherwise
+// "anthropic". An OPEN entry past its window counts as neither: the next
+// request for that model goes to Anthropic, and a model nobody asks for again
+// must not pin the hint to the failover tier.
+func (b *Breaker) RoutingProvider(now time.Time) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	probe := false
 	for _, e := range b.entries {
+		if expired(e, now) {
+			continue
+		}
 		switch e.State {
 		case Open:
 			return b.failoverProvider
@@ -274,11 +290,17 @@ func (b *Breaker) RoutingProvider() string {
 	return "anthropic"
 }
 
-func (b *Breaker) Snapshot() Snapshot {
+// Snapshot copies breaker state for display. OPEN entries past their window
+// are omitted: they no longer divert traffic, and Decide resolves them only
+// when that model is next requested, which may be never.
+func (b *Breaker) Snapshot(now time.Time) Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	cp := make(map[string]Entry, len(b.entries))
 	for k, v := range b.entries {
+		if expired(v, now) {
+			continue
+		}
 		cp[k] = v
 	}
 	var lq *LastQuotaEvent
