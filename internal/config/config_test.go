@@ -73,8 +73,8 @@ func TestLoadOK(t *testing.T) {
 func TestMapModelDeepSeekDefault(t *testing.T) {
 	cfg := config.Default()
 	m, ok := cfg.MapModelDeepSeek("claude-opus-5")
-	if !ok || m != "deepseek-v4-pro" {
-		t.Fatalf("got %q ok=%v, want deepseek-v4-pro", m, ok)
+	if !ok || m != "deepseek-v4-flash" {
+		t.Fatalf("got %q ok=%v, want deepseek-v4-flash", m, ok)
 	}
 	m, ok = cfg.MapModelDeepSeek("totally-unknown-model")
 	if !ok || m != "deepseek-v4-flash" {
