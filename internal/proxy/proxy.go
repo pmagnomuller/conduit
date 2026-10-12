@@ -299,14 +299,15 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	routing := g.breaker.RoutingProvider()
+	now := time.Now()
+	routing := g.breaker.RoutingProvider(now)
 	if fp := g.breaker.ForcedProvider(); fp != "" {
 		routing = fp
 	}
 	resp := metrics.StatusResponse{
 		Listen:  g.cfg.Listen,
 		Routing: routing,
-		Breaker: g.breaker.Snapshot(),
+		Breaker: g.breaker.Snapshot(now),
 		Counts:  g.metrics.Snapshot(),
 		Upstream: map[string]string{
 			"anthropic": g.cfg.Anthropic.BaseURL,
