@@ -580,7 +580,7 @@ func TestGLMHardDownFailsOverToDeepSeek(t *testing.T) {
 	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
 		t.Fatal(err)
 	}
-	if m["model"] != "deepseek-v4-pro" {
+	if m["model"] != "deepseek-v4-flash" {
 		t.Fatalf("model rewrite=%v", m["model"])
 	}
 	if !strings.HasPrefix(f.deepSeekAuth[0], "Bearer deepseek-test-key") {
@@ -641,8 +641,8 @@ func TestPreStream429FailsOverToDeepSeekWhenConfigured(t *testing.T) {
 	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
 		t.Fatal(err)
 	}
-	if m["model"] != "deepseek-v4-pro" {
-		t.Fatalf("model rewrite=%v, want deepseek-v4-pro", m["model"])
+	if m["model"] != "deepseek-v4-flash" {
+		t.Fatalf("model rewrite=%v, want deepseek-v4-flash", m["model"])
 	}
 	assertNoSecretOnDisk(t, dir, fakeToken)
 	assertNoSecretOnDisk(t, dir, "zai-test-key-secret")
@@ -746,8 +746,8 @@ func TestDeepSeekStripsArtifactTool(t *testing.T) {
 	if err := json.Unmarshal(f.deepSeekBodies[0], &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Model != "deepseek-v4-pro" {
-		t.Fatalf("model=%q, want deepseek-v4-pro", m.Model)
+	if m.Model != "deepseek-v4-flash" {
+		t.Fatalf("model=%q, want deepseek-v4-flash", m.Model)
 	}
 	var names []string
 	for _, tl := range m.Tools {
@@ -872,7 +872,7 @@ func TestDeepSeekDisablesThinkingWhenHistoryLacksIt(t *testing.T) {
 
 	got := postToForcedDeepSeek(t, reqBody)
 
-	want := []byte(`{"model":"deepseek-v4-pro","max_tokens":64,"stream":false,
+	want := []byte(`{"model":"deepseek-v4-flash","max_tokens":64,"stream":false,
 		"thinking":{"type":"disabled"},
 		"tools":[
 			{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}
@@ -915,7 +915,7 @@ func TestDeepSeekKeepsThinkingWhenHistoryEchoesIt(t *testing.T) {
 	if err := json.Unmarshal(reqBody, &want); err != nil {
 		t.Fatal(err)
 	}
-	want["model"] = "deepseek-v4-pro"
+	want["model"] = "deepseek-v4-flash"
 	wantRaw, _ := json.Marshal(want)
 	if canonicalJSON(t, got) != canonicalJSON(t, wantRaw) {
 		t.Fatalf("deepseek body:\n got %s\nwant %s", canonicalJSON(t, got), canonicalJSON(t, wantRaw))
@@ -939,7 +939,7 @@ func TestDeepSeekLeavesThinkingWithoutTools(t *testing.T) {
 	if err := json.Unmarshal(reqBody, &want); err != nil {
 		t.Fatal(err)
 	}
-	want["model"] = "deepseek-v4-pro"
+	want["model"] = "deepseek-v4-flash"
 	wantRaw, _ := json.Marshal(want)
 	if canonicalJSON(t, got) != canonicalJSON(t, wantRaw) {
 		t.Fatalf("deepseek body:\n got %s\nwant %s", canonicalJSON(t, got), canonicalJSON(t, wantRaw))
