@@ -26,6 +26,8 @@ type decision struct {
 	Margin         float64   `json:"margin,omitempty"`
 	Pick           string    `json:"pick,omitempty"`
 	Policy         string    `json:"policy,omitempty"`
+	Tier           string    `json:"tier,omitempty"`
+	TierEvidence   int       `json:"tier_evidence,omitempty"`
 	EstInputUSD    float64   `json:"est_input_usd,omitempty"`
 	BaseInputUSD   float64   `json:"baseline_input_usd,omitempty"`
 	LatencyMS      int64     `json:"latency_ms"`
@@ -127,7 +129,7 @@ func formatCostSummary(n int, est, base float64) string {
 }
 
 // formatDecision is one line per decision: time, requested→chosen, step, lease,
-// source, confidence, latency.
+// source, complexity tier, confidence, latency.
 func formatDecision(d decision) string {
 	chosen := d.Provider
 	if d.Model != "" {
@@ -141,6 +143,12 @@ func formatDecision(d decision) string {
 	}
 	line := fmt.Sprintf("%s %s→%s step=%s lease=%s src=%s",
 		d.At.Local().Format("2006-01-02 15:04:05"), d.RequestedModel, chosen, d.Step, d.Lease, d.Source)
+	if d.Tier != "" {
+		line += " tier=" + d.Tier
+		if d.TierEvidence > 0 {
+			line += fmt.Sprintf("(%d)", d.TierEvidence)
+		}
+	}
 	if d.Confidence > 0 {
 		line += fmt.Sprintf(" conf=%.2f", d.Confidence)
 	}

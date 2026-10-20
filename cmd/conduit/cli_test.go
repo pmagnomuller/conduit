@@ -454,7 +454,7 @@ func TestDecisionsTailsLog(t *testing.T) {
 	path := filepath.Join(dir, "decisions.jsonl")
 	lines := []string{
 		`{"at":"2026-09-22T10:00:00Z","requested_model":"claude-opus-5","provider":"anthropic","model":"claude-opus-5","step":"user_turn","lease":"one_call","source":"jev","confidence":0.5,"latency_ms":300}`,
-		`{"at":"2026-09-22T10:00:01Z","requested_model":"claude-sonnet-5","provider":"glm","model":"glm-5.3-flash","step":"tool_step","lease":"tool_chain","source":"jev","confidence":0.81,"latency_ms":412}`,
+		`{"at":"2026-09-22T10:00:01Z","requested_model":"claude-sonnet-5","provider":"glm","model":"glm-5.3-flash","step":"tool_step","lease":"tool_chain","source":"jev","tier":"standard","tier_evidence":2,"confidence":0.81,"latency_ms":412}`,
 		`{"at":"2026-09-22T10:00:02Z","requested_model":"claude-haiku-4-5","provider":"glm","model":"glm-5.3","step":"other","lease":"one_call","source":"fail_open","reason":"timeout","latency_ms":4001}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
@@ -471,7 +471,7 @@ func TestDecisionsTailsLog(t *testing.T) {
 		t.Fatalf("want 2 lines, got %d:\n%s", len(got), out)
 	}
 	for _, want := range []string{
-		"claude-sonnet-5→glm/glm-5.3-flash", "step=tool_step", "lease=tool_chain", "src=jev", "conf=0.81", "412ms",
+		"claude-sonnet-5→glm/glm-5.3-flash", "step=tool_step", "lease=tool_chain", "src=jev", "tier=standard(2)", "conf=0.81", "412ms",
 	} {
 		if !strings.Contains(got[0], want) {
 			t.Errorf("first line %q missing %q", got[0], want)

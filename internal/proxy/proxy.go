@@ -299,14 +299,15 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	routing := g.breaker.RoutingProvider()
+	now := time.Now()
+	routing := g.breaker.RoutingProvider(now)
 	if fp := g.breaker.ForcedProvider(); fp != "" {
 		routing = fp
 	}
 	resp := metrics.StatusResponse{
 		Listen:  g.cfg.Listen,
 		Routing: routing,
-		Breaker: g.breaker.Snapshot(),
+		Breaker: g.breaker.Snapshot(now),
 		Counts:  g.metrics.Snapshot(),
 		Upstream: map[string]string{
 			"anthropic": g.cfg.Anthropic.BaseURL,
@@ -1035,6 +1036,7 @@ func prepareDeepSeekBody(body []byte, model string) []byte {
 	if b, err := json.Marshal(model); err == nil {
 		obj["model"] = b
 	}
+	inlineToolDefinitions(obj)
 	if rawTools, ok := obj["tools"]; ok {
 		// A tools list that only held Artifact is dropped whole: "tools": []
 		// is not what the client asked for and some validators reject it.
@@ -1050,6 +1052,112 @@ func prepareDeepSeekBody(body []byte, model string) []byte {
 		return body
 	}
 	return out
+}
+
+// inlineToolDefinitions rewrites Claude Code's deferred-tool additions into a
+// shape DeepSeek accepts. With tool search on (Claude Code 2.1.286+), a turn
+// adds tools mid-conversation as {"type":"tool_addition","tool":{"type":
+// "tool_definition","definition":{...}}}; DeepSeek's content-block enum knows
+// tool_reference but not tool_definition, so the whole request 422s
+// ("unknown variant `tool_definition`, expected `tool_reference`").
+//
+// Each definition is appended to the top-level tools list (unless a tool of
+// that name is already there) and the block keeps only a tool_reference by
+// name, which DeepSeek accepts and resolves against that list. An Artifact
+// addition is dropped outright, since dropArtifactTool removes Artifact from
+// the tools list and a reference to it would dangle; a message left with no
+// blocks is dropped too. Nothing else in the conversation changes.
+func inlineToolDefinitions(obj map[string]json.RawMessage) {
+	var msgs []map[string]json.RawMessage
+	if err := json.Unmarshal(obj["messages"], &msgs); err != nil {
+		return
+	}
+	var tools []json.RawMessage
+	if raw, ok := obj["tools"]; ok {
+		if err := json.Unmarshal(raw, &tools); err != nil {
+			return
+		}
+	}
+	known := map[string]bool{}
+	for _, t := range tools {
+		if name := toolName(t); name != "" {
+			known[name] = true
+		}
+	}
+	changed := false
+	keptMsgs := make([]map[string]json.RawMessage, 0, len(msgs))
+	for _, m := range msgs {
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(m["content"], &blocks) != nil {
+			keptMsgs = append(keptMsgs, m)
+			continue
+		}
+		touched := false
+		kept := make([]map[string]json.RawMessage, 0, len(blocks))
+		for _, b := range blocks {
+			var inner struct {
+				Type       string          `json:"type"`
+				Definition json.RawMessage `json:"definition"`
+			}
+			if json.Unmarshal(b["tool"], &inner) != nil || inner.Type != "tool_definition" {
+				kept = append(kept, b)
+				continue
+			}
+			name := toolName(inner.Definition)
+			ref, err := json.Marshal(map[string]string{"type": "tool_reference", "name": name})
+			if name == "" || err != nil {
+				kept = append(kept, b)
+				continue
+			}
+			touched = true
+			if name == "Artifact" {
+				continue
+			}
+			if !known[name] {
+				tools = append(tools, inner.Definition)
+				known[name] = true
+			}
+			b["tool"] = ref
+			kept = append(kept, b)
+		}
+		if !touched {
+			keptMsgs = append(keptMsgs, m)
+			continue
+		}
+		changed = true
+		if len(kept) == 0 {
+			continue
+		}
+		raw, err := json.Marshal(kept)
+		if err != nil {
+			return
+		}
+		m["content"] = raw
+		keptMsgs = append(keptMsgs, m)
+	}
+	if !changed {
+		return
+	}
+	rawMsgs, err := json.Marshal(keptMsgs)
+	if err != nil {
+		return
+	}
+	obj["messages"] = rawMsgs
+	if len(tools) > 0 {
+		rawTools, err := json.Marshal(tools)
+		if err != nil {
+			return
+		}
+		obj["tools"] = rawTools
+	}
+}
+
+func toolName(raw json.RawMessage) string {
+	var t struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal(raw, &t)
+	return t.Name
 }
 
 // disableUnechoedThinking turns DeepSeek's thinking mode off for a request its
