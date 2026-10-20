@@ -968,7 +968,7 @@ func TestDeepSeekInlinesToolDefinitions(t *testing.T) {
 
 	got := postToForcedDeepSeek(t, reqBody)
 
-	want := []byte(`{"model":"deepseek-v4-pro","max_tokens":64,
+	want := []byte(`{"model":"deepseek-v4-flash","max_tokens":64,
 		"tools":[
 			{"name":"Bash","description":"run","input_schema":{"type":"object"}},
 			{"name":"Grep","description":"search","input_schema":{"type":"object"}}
