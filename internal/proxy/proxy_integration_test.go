@@ -946,6 +946,47 @@ func TestDeepSeekLeavesThinkingWithoutTools(t *testing.T) {
 	}
 }
 
+// Claude Code's tool search adds deferred tools mid-conversation as
+// tool_definition blocks, which DeepSeek rejects (422 "unknown variant
+// `tool_definition`"). The gateway moves each definition into tools and leaves
+// a tool_reference by name; an Artifact addition is dropped with its message.
+func TestDeepSeekInlinesToolDefinitions(t *testing.T) {
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":64,
+		"tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}}],
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"system","content":[
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"Grep","description":"search","input_schema":{"type":"object"}}}},
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"Bash","description":"run","input_schema":{"type":"object"}}}},
+				{"type":"tool_removal","tool":{"type":"tool_reference","name":"Old"}}
+			]},
+			{"role":"system","content":[
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"Artifact","description":"render","input_schema":{"type":"object"}}}}
+			]},
+			{"role":"user","content":"go"}
+		]}`)
+
+	got := postToForcedDeepSeek(t, reqBody)
+
+	want := []byte(`{"model":"deepseek-v4-pro","max_tokens":64,
+		"tools":[
+			{"name":"Bash","description":"run","input_schema":{"type":"object"}},
+			{"name":"Grep","description":"search","input_schema":{"type":"object"}}
+		],
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"system","content":[
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"Grep"}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"Bash"}},
+				{"type":"tool_removal","tool":{"type":"tool_reference","name":"Old"}}
+			]},
+			{"role":"user","content":"go"}
+		]}`)
+	if canonicalJSON(t, got) != canonicalJSON(t, want) {
+		t.Fatalf("deepseek body:\n got %s\nwant %s", canonicalJSON(t, got), canonicalJSON(t, want))
+	}
+}
+
 func TestDeepSeekTierSkippedWhenNoKey(t *testing.T) {
 	f := &fakeUpstreams{}
 	f.anthropic = func(w http.ResponseWriter, r *http.Request) {
