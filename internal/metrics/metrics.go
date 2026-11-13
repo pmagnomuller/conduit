@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/pedro-mueller/conduit/internal/breaker"
+	"github.com/pedro-mueller/conduit/internal/seats"
 )
 
 type Counters struct {
@@ -98,4 +99,6 @@ type StatusResponse struct {
 	// Routing mode (auto|pinned|jev) and whether the Jev router is usable.
 	Mode       string `json:"mode"`
 	JevEnabled bool   `json:"jev_enabled"`
+	// Seats is the in-flight lease table. Empty when no caps are configured.
+	Seats map[string]seats.Lease `json:"seats,omitempty"`
 }

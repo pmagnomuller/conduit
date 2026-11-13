@@ -493,6 +493,13 @@ function renderBreaker(s) {
   $('tiles').innerHTML = tiles.map(function (t) {
     return '<div class="tile ' + t[1] + '"><div class="k">' + t[0] + '</div><div class="v">' + (t[2] || 0) + '</div></div>';
   }).join('');
+  var seatKeys = Object.keys(s.seats || {});
+  if (seatKeys.length) {
+    $('tiles').innerHTML += seatKeys.map(function (k) {
+      var seat = s.seats[k] || {};
+      return '<div class="tile"><div class="k">' + esc(k) + '</div><div class="v">' + (seat.in_flight || 0) + '/' + (seat.cap || 0) + '</div></div>';
+    }).join('');
+  }
 }
 
 async function setMode(m) {

@@ -21,6 +21,11 @@ type Config struct {
 	Log       LogConfig       `toml:"log"`
 	Paths     PathsConfig     `toml:"paths"`
 	Jev       JevConfig       `toml:"jev"`
+	// Seats caps in-flight requests per "provider/model". A "provider/*" key
+	// covers every model of that provider that has no exact cap.
+	Seats map[string]int `toml:"seats"`
+	// Roles maps a stable name to an ordered "provider/model" chain.
+	Roles map[string][]string `toml:"roles"`
 
 	// Resolved at load time.
 	ZAIAPIKey      string `toml:"-"`

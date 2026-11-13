@@ -25,6 +25,7 @@ import (
 	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/redact"
 	"github.com/pedro-mueller/conduit/internal/route"
+	"github.com/pedro-mueller/conduit/internal/seats"
 )
 
 const anthropicUpstream = "anthropic"
@@ -56,6 +57,7 @@ type Gateway struct {
 	capture *capture.Writer
 	metrics *metrics.Counters
 	router  Decider
+	seats   *seats.Table
 	client  *http.Client
 	log     *slog.Logger
 
@@ -76,6 +78,7 @@ func New(cfg config.Config, br *breaker.Breaker, cap *capture.Writer, met *metri
 		capture: cap,
 		metrics: met,
 		router:  router,
+		seats:   seats.New(cfg.Seats),
 		client: &http.Client{
 			// No global Timeout — streaming requests can run a long time.
 			Transport: &http.Transport{
@@ -319,6 +322,7 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 		JevEnabled:       g.jevEnabled(),
 		FailoverProvider: g.failoverProvider(),
 		LastRequest:      g.lastRequestSnapshot(),
+		Seats:            g.seats.Snapshot(),
 	}
 	if g.cfg.DeepSeekAPIKey != "" {
 		resp.Upstream["deepseek"] = g.cfg.DeepSeek.BaseURL
@@ -347,6 +351,27 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	model := extractModel(body)
+
+	if role := r.Header.Get("X-Conduit-Role"); role != "" && g.breaker.ForcedProvider() == "" {
+		provider, picked, ok := route.PickRole(g.cfg.Roles, role, func(provider, model string) bool {
+			return provider == anthropicUpstream && g.breaker.State(anthropicUpstream, model, time.Now()) == breaker.Open
+		})
+		if !ok {
+			http.Error(w, `{"type":"error","error":{"type":"gateway_error","message":"role has no usable provider"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		switch provider {
+		case "glm":
+			g.serveGLM(w, r, body, model, start, false, picked)
+		case "deepseek":
+			if !g.tryDeepSeek(w, r, body, model, start, false, "role", picked) {
+				http.Error(w, `{"type":"error","error":{"type":"gateway_error","message":"role picked deepseek but DEEPSEEK_API_KEY is unset"}}`, http.StatusBadGateway)
+			}
+		default:
+			g.serveAnthropic(w, r, body, model, start, false, picked)
+		}
+		return
+	}
 
 	switch g.breaker.ForcedProvider() {
 	case "glm":
@@ -495,6 +520,16 @@ func (g *Gateway) probeDue(model string) bool {
 // and notify bookkeeping keys on the model actually sent upstream (model when
 // no override applies), never on the inbound id.
 func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, isProbe bool, modelOverride string) {
+	sent := model
+	if modelOverride != "" {
+		sent = modelOverride
+	}
+	release, ok := g.seats.Acquire("anthropic", sent)
+	if !ok {
+		rejectSeat(w)
+		return
+	}
+	defer release()
 	var lastResp *http.Response
 	var lastBody []byte
 	var lastErr error
@@ -615,6 +650,16 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 // serveGLM forwards to Z.ai. modelOverride (jev mode) bypasses the model map;
 // "" uses the configured mapping (and ForcedModel when pinned to glm).
 func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, modelOverride string) {
+	sent := model
+	if modelOverride != "" {
+		sent = modelOverride
+	}
+	release, ok := g.seats.Acquire("glm", sent)
+	if !ok {
+		rejectSeat(w)
+		return
+	}
+	defer release()
 	glmModel := modelOverride
 	if glmModel == "" {
 		var ok bool
@@ -715,6 +760,13 @@ func (g *Gateway) notifyFailover(model, reason string) {
 	notify.FailoverToGLM(model, g.glmModelFor(model), reason)
 }
 
+func rejectSeat(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "2")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"conduit seat cap"}}`))
+}
+
 // serveFailover routes the request to the configured failover tier after the
 // Anthropic breaker opens. modelOverride maps the inbound model when jev changed
 // it upstream; "" lets the tier's own model map apply.
@@ -751,6 +803,16 @@ func (g *Gateway) tryDeepSeek(w http.ResponseWriter, r *http.Request, body []byt
 // serveDeepSeek forwards to DeepSeek. modelOverride (jev mode) bypasses the
 // model map; "" uses the configured mapping (and ForcedModel when pinned).
 func (g *Gateway) serveDeepSeek(w http.ResponseWriter, r *http.Request, body []byte, model string, start time.Time, failover bool, reason string, modelOverride string) {
+	sent := model
+	if modelOverride != "" {
+		sent = modelOverride
+	}
+	release, ok := g.seats.Acquire("deepseek", sent)
+	if !ok {
+		rejectSeat(w)
+		return
+	}
+	defer release()
 	dsModel := modelOverride
 	if dsModel == "" {
 		var ok bool
