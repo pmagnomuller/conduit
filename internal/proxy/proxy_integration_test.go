@@ -25,6 +25,7 @@ import (
 	"github.com/pedro-mueller/conduit/internal/proxy"
 	"github.com/pedro-mueller/conduit/internal/redact"
 	"github.com/pedro-mueller/conduit/internal/route"
+	"github.com/pedro-mueller/conduit/internal/usage"
 )
 
 const fakeToken = "sk-ant-secret-token-DO-NOT-LEAK-abc123"
@@ -47,6 +48,11 @@ type fakeUpstreams struct {
 	proactiveUtilization float64
 	// decider, when set, is injected as the jev router (nil = jev disabled).
 	decider proxy.Decider
+	// withSpend attaches the usage ledger at <dir>/usage.jsonl; spendOpts
+	// tunes it (a nil Notify is replaced by a no-op).
+	withSpend bool
+	spendOpts usage.Options
+	spend     *usage.Service
 
 	mu             sync.Mutex
 	glmBodies      [][]byte
@@ -144,6 +150,17 @@ func newGateway(t *testing.T, f *fakeUpstreams) (*httptest.Server, *breaker.Brea
 	capWriter := capture.New(capturePath, true)
 	met := metrics.New()
 	gw := proxy.New(cfg, br, capWriter, met, f.decider, log)
+	if f.withSpend {
+		cfg.Spend.UsagePath = filepath.Join(dir, "usage.jsonl")
+		cfg.Spend.BalanceURL = ""
+		cfg.Spend.ClaudeQuota = false
+		if f.spendOpts.Notify == nil {
+			f.spendOpts.Notify = func(string, string) {}
+		}
+		f.spend = usage.NewService(cfg, f.spendOpts)
+		t.Cleanup(func() { _ = f.spend.Close() })
+		gw.SetSpend(f.spend)
+	}
 
 	srv := httptest.NewServer(gw.Handler())
 	t.Cleanup(srv.Close)

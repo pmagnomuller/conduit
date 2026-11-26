@@ -20,6 +20,7 @@ import (
 	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/proxy"
 	"github.com/pedro-mueller/conduit/internal/route"
+	"github.com/pedro-mueller/conduit/internal/usage"
 )
 
 func main() {
@@ -44,6 +45,9 @@ func main() {
 	met := metrics.New()
 	router := route.New(cfg.Jev, cfg.TypeSafeAPIKey, log)
 	gw := proxy.New(cfg, br, cap, met, router, log)
+	spend := usage.NewService(cfg, usage.Options{Logger: log})
+	defer func() { _ = spend.Close() }()
+	gw.SetSpend(spend)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -70,6 +74,8 @@ func main() {
 		"jev_enabled", router.Enabled(),
 		"mode", string(br.Mode()),
 		"state", cfg.Paths.StatePath,
+		"usage_ledger", cfg.Spend.UsagePath,
+		"spend_alert", cfg.Spend.Alert,
 	)
 
 	go func() {

@@ -366,6 +366,7 @@ is the text Jev reads, so it is the tuning lever.
 | `internal/announce` | injects the one-shot chat notice into the first assistant text, for JSON and SSE bodies |
 | `internal/capture` | appends non-2xx upstream responses to `upstream-errors.jsonl` for later classification work |
 | `internal/redact` | strips credentials (header names, `Bearer …` tokens) from anything that is logged or persisted |
+| `internal/usage` | per-request usage and cost: a `Tap` parses `usage` out of each successful reply as `writeUpstream` copies it (JSON or SSE, never buffering a stream), prices it, appends it to `usage.jsonl`, rolls it up per day/hour/provider for `/_gateway/spend`, reads the DeepSeek balance and Claude plan quota, and posts the paid-spend alert |
 
 ---
 
@@ -377,7 +378,8 @@ is the text Jev reads, so it is the tuning lever.
 | `GET /_gateway/status` | mode, routing, breaker snapshot, counters, upstream URLs, last request |
 | `GET /_gateway/route` | mode, pin, available models, Jev catalog + recent decisions |
 | `POST /_gateway/route` | `{"clear":true}` · `{"provider","model"}` · `{"mode":"auto\|pinned\|jev"}` — requires `application/json` or form content type and refuses a foreign `Origin` |
-| `GET /_gateway/ui` | the control page (single self-contained HTML, polls every 2 s) |
+| `GET /_gateway/spend` | today's paid USD, per-day and per-hour totals by provider, latest requests, DeepSeek credit, Claude plan windows (`?days=`, `?recent=`) |
+| `GET /_gateway/ui` | the control page (single self-contained HTML): Control tab polls every 2 s, Spend tab every 10 s |
 | anything else | proxied per §2 |
 
 Response headers on proxied calls: `X-Conduit-Provider` always;
@@ -392,7 +394,7 @@ Two binaries are built from this module:
 | binary | source | installed as | role |
 |---|---|---|---|
 | gateway | `cmd/gateway` | `~/.local/bin/conduit` | the daemon; runs under launchd on macOS (`contrib/macos/com.pedro.conduit.plist`, KeepAlive) or `nohup` elsewhere |
-| CLI | `cmd/conduit` | `~/.local/bin/conduitctl` | loopback client for the endpoints above (`route`, `status`, `decisions`, `ui`) |
+| CLI | `cmd/conduit` | `~/.local/bin/conduitctl` | loopback client for the endpoints above (`route`, `status`, `decisions`, `spend`, `ui`) |
 
 State on disk:
 
@@ -403,6 +405,7 @@ State on disk:
 | `~/.local/state/conduit/state.json` | breaker entries, mode, pin, last quota event |
 | `~/.local/state/conduit/decisions.jsonl` (+ `.1`) | Jev decision log |
 | `~/.local/state/conduit/upstream-errors.jsonl` | captured non-2xx upstream responses |
+| `~/.local/state/conduit/usage.jsonl` (+ `.1`, `.alert`) | per-request usage and cost ledger; alert dedup state |
 | `~/.local/state/conduit/route.json` | current provider/model for status-line integrations |
 | `~/.local/state/conduit/gateway.log` | structured JSON log, one `request` line per proxied call |
 | `~/.claude/settings.json` | `ANTHROPIC_BASE_URL` pointed at the gateway by `setup.sh` |
@@ -436,7 +439,7 @@ State on disk:
 .
 ├── cmd/
 │   ├── gateway/        the daemon (main.go wires config → breaker → capture → metrics → route → proxy)
-│   └── conduit/        conduitctl: route.go, status.go, decisions.go, ui.go, client.go, cli_test.go
+│   └── conduit/        conduitctl: route.go, status.go, decisions.go, spend.go, ui.go, client.go (+ tests)
 ├── internal/
 │   ├── proxy/          handleProxy + provider functions, HTTP API, ui.go (embedded control page)
 │   ├── route/          Jev: mode.go, dossier.go, client.go, router.go (+ tests)
@@ -447,7 +450,8 @@ State on disk:
 │   ├── notify/         desktop toasts, route.json, notice toggles
 │   ├── announce/       chat-notice injection (JSON + SSE)
 │   ├── capture/        upstream-errors.jsonl writer
-│   └── redact/         credential scrubbing
+│   ├── redact/         credential scrubbing
+│   └── usage/          usage parsing, pricing, usage.jsonl, spend rollup, balance/quota reads, alert
 ├── scripts/
 │   ├── lib.sh          shared shell: key prompts, .env upsert, launchd/nohup lifecycle, Claude/OpenCode settings patching
 │   ├── install-launchagent.sh
@@ -462,7 +466,7 @@ State on disk:
 └── FINDINGS.md         wire-level findings about the upstreams (quota headers, GLM quirks, …)
 ```
 
-Dependency direction inside `internal/`: `proxy → {breaker, route, classify, config, metrics, notify, announce, capture, redact}`, `breaker → route` (for `Mode`), `route → {config, redact}`. `route` never imports `breaker`, and `config` imports nothing from the module — which is why `Candidate` lives in `config` and is aliased by `route`.
+Dependency direction inside `internal/`: `proxy → {breaker, route, classify, config, metrics, notify, announce, capture, redact, usage}`, `usage → {config, redact}`, `breaker → route` (for `Mode`), `route → {config, redact}`. `route` never imports `breaker`, and `config` imports nothing from the module — which is why `Candidate` lives in `config` and is aliased by `route`.
 
 The only third-party dependency is `github.com/pelletier/go-toml/v2`.
 

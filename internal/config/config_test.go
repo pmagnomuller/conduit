@@ -429,3 +429,51 @@ func TestLoadRestrictedPatterns(t *testing.T) {
 		t.Fatal("invalid regexp accepted")
 	}
 }
+
+func TestSpendDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("ZAI_API_KEY", "zai-test")
+	t.Setenv("CONDUIT_SPEND_NOTIFY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp := cfg.Spend
+	home, _ := os.UserHomeDir()
+	if sp.UsagePath != filepath.Join(home, ".local/state/conduit/usage.jsonl") || !sp.Alert || sp.AlertStepUSD != 0.50 ||
+		sp.BalanceCacheSeconds != 120 || !sp.ClaudeQuota || sp.GLMBilling != "" || cfg.AnthropicAPIKey != "" {
+		t.Fatalf("defaults: %+v", sp)
+	}
+
+	write("[spend]\nalert = false\nalert_step_usd = 2\nglm_billing = \"metered\"\nusage_path = \"~/x/usage.jsonl\"\n")
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Spend.Alert || cfg.Spend.AlertStepUSD != 2 || cfg.Spend.GLMBilling != "metered" || cfg.Spend.UsagePath != filepath.Join(home, "x/usage.jsonl") {
+		t.Fatalf("overrides: %+v", cfg.Spend)
+	}
+
+	write("")
+	t.Setenv("CONDUIT_SPEND_NOTIFY", "0")
+	t.Setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+	cfg, err = config.Load(path)
+	if err != nil || cfg.Spend.Alert || cfg.AnthropicAPIKey == "" {
+		t.Fatalf("env: alert=%v key set=%v err=%v", cfg.Spend.Alert, cfg.AnthropicAPIKey != "", err)
+	}
+
+	write("[spend]\nglm_billing = \"free\"\n")
+	if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "glm_billing") {
+		t.Fatalf("invalid glm_billing: %v", err)
+	}
+}

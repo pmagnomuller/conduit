@@ -21,6 +21,7 @@ type Config struct {
 	Log       LogConfig       `toml:"log"`
 	Paths     PathsConfig     `toml:"paths"`
 	Jev       JevConfig       `toml:"jev"`
+	Spend     SpendConfig     `toml:"spend"`
 
 	// Resolved at load time.
 	ZAIAPIKey      string `toml:"-"`
@@ -28,6 +29,10 @@ type Config struct {
 	// TypeSafeAPIKey enables Jev routing mode. Optional: when empty the
 	// router reports Enabled()==false and the gateway stays in auto/pinned.
 	TypeSafeAPIKey string `toml:"-"`
+	// AnthropicAPIKey is ANTHROPIC_API_KEY when present. Its presence is what
+	// makes Anthropic traffic metered spend rather than plan traffic; conduit
+	// itself still forwards the inbound credential unchanged.
+	AnthropicAPIKey string `toml:"-"`
 
 	// Local-token routing: inbound requests whose credential matches
 	// LocalToken bypass Anthropic and go straight to LocalTokenProvider.
@@ -142,6 +147,36 @@ func DefaultRestrictedPatterns() []string {
 	}
 }
 
+// SpendConfig configures the per-request usage ledger, the spend endpoint and
+// tab, and the paid-spend alert.
+type SpendConfig struct {
+	// UsagePath is the append-only JSONL ledger of per-request usage and cost.
+	// Empty disables recording (the spend endpoint then reports an empty
+	// ledger and the alert stays silent).
+	UsagePath string `toml:"usage_path"`
+	// Prices is the spend price table (USD per million tokens), layered over
+	// the built-in list prices and the Jev catalog's: an entry here wins for
+	// its provider/model, and a rate it leaves at 0 keeps the built-in one.
+	Prices []Candidate `toml:"prices"`
+	// GLMBilling overrides how GLM/Z.ai traffic is billed: "" (default — a
+	// coding plan, so subscription: tokens recorded at USD 0) or "metered" (a
+	// pay-as-you-go key, priced from the catalog).
+	GLMBilling string `toml:"glm_billing"`
+	// Alert (on by default) posts a desktop notification when today's paid
+	// spend first goes above $0 and again each time it has grown by
+	// AlertStepUSD. alert = false, or CONDUIT_SPEND_NOTIFY=0, silences it.
+	Alert        bool    `toml:"alert"`
+	AlertStepUSD float64 `toml:"alert_step_usd"`
+	// BalanceURL is the DeepSeek credit-balance endpoint. Empty disables the
+	// lookup.
+	BalanceURL string `toml:"balance_url"`
+	// BalanceCacheSeconds bounds how stale the credit balance may be.
+	BalanceCacheSeconds int `toml:"balance_cache_seconds"`
+	// ClaudeQuota reads the Claude plan windows and extra usage from
+	// quota-axi (when it is on PATH) for the spend view. false skips it.
+	ClaudeQuota bool `toml:"claude_quota"`
+}
+
 // Candidate is one provider/model Jev may pick. It lives here (not in
 // internal/route) so route can import config without a cycle; route aliases it.
 type Candidate struct {
@@ -151,9 +186,10 @@ type Candidate struct {
 	// List prices, USD per million tokens, for the decision log's cost
 	// estimate only (never sent to Jev: the policy is capability-first). 0 →
 	// fall back to the default catalog's price for the same key, if any.
-	PriceIn        float64 `json:"price_in,omitempty"         toml:"price_in"`
-	PriceOut       float64 `json:"price_out,omitempty"        toml:"price_out"`
-	PriceCacheRead float64 `json:"price_cache_read,omitempty" toml:"price_cache_read"`
+	PriceIn         float64 `json:"price_in,omitempty"          toml:"price_in"`
+	PriceOut        float64 `json:"price_out,omitempty"         toml:"price_out"`
+	PriceCacheRead  float64 `json:"price_cache_read,omitempty"  toml:"price_cache_read"`
+	PriceCacheWrite float64 `json:"price_cache_write,omitempty" toml:"price_cache_write"`
 	// Tier bands the candidate for the complexity classifier: "light",
 	// "standard" or "heavy". A catalog override with a blank tier inherits
 	// the default catalog's tier by key, then "standard".
@@ -172,23 +208,23 @@ func (c Candidate) Key() string { return c.Provider + "/" + c.Model }
 // answer 200 while a weaker model serves the request (see the alias issue).
 func DefaultCatalog() []Candidate {
 	return []Candidate{
-		{Provider: "anthropic", Model: "claude-fable-5-1", Tier: "heavy", PriceIn: 10, PriceOut: 50, PriceCacheRead: 0.25,
+		{Provider: "anthropic", Model: "claude-fable-5-1", Tier: "heavy", PriceIn: 10, PriceOut: 50, PriceCacheRead: 0.25, PriceCacheWrite: 12.5,
 			Profile: "Strongest available. Long-horizon agentic work, hard architecture, gnarly debugging, security or concurrency review, anything where a wrong call is costly to undo."},
-		{Provider: "anthropic", Model: "claude-opus-5-5", Tier: "heavy", PriceIn: 4, PriceOut: 20, PriceCacheRead: 0.20,
+		{Provider: "anthropic", Model: "claude-opus-5-5", Tier: "heavy", PriceIn: 4, PriceOut: 20, PriceCacheRead: 0.20, PriceCacheWrite: 5,
 			Profile: "Frontier reasoning and coding, second only to fable-5-1. Ambiguous broad tasks, multi-file design, subtle correctness. Thinking always on; effort defaults to medium."},
-		{Provider: "anthropic", Model: "claude-opus-5", Tier: "heavy", PriceIn: 5, PriceOut: 25, PriceCacheRead: 0.50,
+		{Provider: "anthropic", Model: "claude-opus-5", Tier: "heavy", PriceIn: 5, PriceOut: 25, PriceCacheRead: 0.50, PriceCacheWrite: 6.25,
 			Profile: "Previous Opus generation. Same class of work as opus-5-5 when that tier is unavailable."},
-		{Provider: "anthropic", Model: "claude-sonnet-5", Tier: "standard", PriceIn: 2, PriceOut: 10, PriceCacheRead: 0.20,
+		{Provider: "anthropic", Model: "claude-sonnet-5", Tier: "standard", PriceIn: 2, PriceOut: 10, PriceCacheRead: 0.20, PriceCacheWrite: 2.5,
 			Profile: "Strong general implementation: cross-file refactors, feature work with clear requirements, robust tests."},
-		{Provider: "anthropic", Model: "claude-haiku-4-5", Tier: "light", PriceIn: 1, PriceOut: 5, PriceCacheRead: 0.10,
+		{Provider: "anthropic", Model: "claude-haiku-4-5", Tier: "light", PriceIn: 1, PriceOut: 5, PriceCacheRead: 0.10, PriceCacheWrite: 1.25,
 			Profile: "Light, fast work only: a title, a summary, one mechanical edit with a known target, a trivial tool continuation."},
-		{Provider: "glm", Model: "glm-5.3", Tier: "standard", PriceIn: 1.40, PriceOut: 4.40, PriceCacheRead: 0.26,
+		{Provider: "glm", Model: "glm-5.3", Tier: "standard", PriceIn: 1.40, PriceOut: 4.40, PriceCacheRead: 0.26, PriceCacheWrite: 1.40,
 			Profile: "Capable coding model off the Claude plan: bounded implementation with clear requirements and known patterns."},
-		{Provider: "glm", Model: "glm-5.3-flash", Tier: "light", PriceIn: 0.15, PriceOut: 0.50, PriceCacheRead: 0.03,
+		{Provider: "glm", Model: "glm-5.3-flash", Tier: "light", PriceIn: 0.15, PriceOut: 0.50, PriceCacheRead: 0.03, PriceCacheWrite: 0.15,
 			Profile: "Lighter GLM tier: mechanical follow-through, formatting, simple tool continuations."},
-		{Provider: "deepseek", Model: "deepseek-v4-pro", Tier: "standard", PriceIn: 1.32, PriceOut: 3.96, PriceCacheRead: 0.044,
+		{Provider: "deepseek", Model: "deepseek-v4-pro", Tier: "standard", PriceIn: 1.32, PriceOut: 3.96, PriceCacheRead: 0.044, PriceCacheWrite: 1.32,
 			Profile: "Strongest DeepSeek tier: reasoning-heavy implementation and debugging. Needs DEEPSEEK_API_KEY."},
-		{Provider: "deepseek", Model: "deepseek-v4-flash", Tier: "light", PriceIn: 0.30, PriceOut: 1.20, PriceCacheRead: 0.006,
+		{Provider: "deepseek", Model: "deepseek-v4-flash", Tier: "light", PriceIn: 0.30, PriceOut: 1.20, PriceCacheRead: 0.006, PriceCacheWrite: 0.30,
 			Profile: "Cheapest tier, bounded mechanical work only. Needs DEEPSEEK_API_KEY. The retired ids deepseek-chat and deepseek-reasoner are aliases to this model, not stronger tiers."},
 	}
 }
@@ -258,6 +294,14 @@ func Default() Config {
 			Level:                 "info",
 			CaptureUpstreamErrors: true,
 			CapturePath:           "~/.local/state/conduit/upstream-errors.jsonl",
+		},
+		Spend: SpendConfig{
+			UsagePath:           "~/.local/state/conduit/usage.jsonl",
+			Alert:               true,
+			AlertStepUSD:        0.50,
+			BalanceURL:          "https://api.deepseek.com/user/balance",
+			BalanceCacheSeconds: 120,
+			ClaudeQuota:         true,
 		},
 		Jev: JevConfig{
 			BaseURL:         "https://api.typesafe.ai/v1/systemone",
@@ -344,6 +388,7 @@ func Load(path string) (Config, error) {
 		tsKeyEnv = "TYPESAFE_API_KEY"
 	}
 	cfg.TypeSafeAPIKey = os.Getenv(tsKeyEnv)
+	cfg.AnthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")
 	if len(cfg.Jev.Catalog) == 0 {
 		cfg.Jev.Catalog = DefaultCatalog()
 	} else {
@@ -388,6 +433,44 @@ func Load(path string) (Config, error) {
 	case "deepseek", "anthropic":
 	default:
 		return Config{}, fmt.Errorf("CONDUIT_LOCAL_PROVIDER must be glm, deepseek, or anthropic (got %q)", cfg.LocalTokenProvider)
+	}
+
+	cfg.Spend.UsagePath = ExpandHome(cfg.Spend.UsagePath)
+	if cfg.Spend.AlertStepUSD <= 0 {
+		cfg.Spend.AlertStepUSD = 0.50
+	}
+	if cfg.Spend.BalanceCacheSeconds <= 0 {
+		cfg.Spend.BalanceCacheSeconds = 120
+	}
+	if v := os.Getenv("CONDUIT_SPEND_NOTIFY"); v == "0" || strings.EqualFold(v, "false") {
+		cfg.Spend.Alert = false
+	}
+	switch cfg.Spend.GLMBilling {
+	case "", "subscription", "metered":
+	default:
+		return Config{}, fmt.Errorf("spend.glm_billing must be subscription or metered (got %q)", cfg.Spend.GLMBilling)
+	}
+	// A [spend.prices] entry may override just one rate; the default catalog
+	// fills the rest for the models it knows.
+	defPrices := map[string]Candidate{}
+	for _, c := range DefaultCatalog() {
+		defPrices[c.Key()] = c
+	}
+	for i, c := range cfg.Spend.Prices {
+		d := defPrices[c.Key()]
+		if c.PriceIn == 0 {
+			c.PriceIn = d.PriceIn
+		}
+		if c.PriceOut == 0 {
+			c.PriceOut = d.PriceOut
+		}
+		if c.PriceCacheRead == 0 {
+			c.PriceCacheRead = d.PriceCacheRead
+		}
+		if c.PriceCacheWrite == 0 {
+			c.PriceCacheWrite = d.PriceCacheWrite
+		}
+		cfg.Spend.Prices[i] = c
 	}
 
 	cfg.Log.CapturePath = ExpandHome(cfg.Log.CapturePath)
