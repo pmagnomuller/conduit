@@ -1,9 +1,11 @@
 package proxy
 
-// uiHTML is the loopback-only control page served at /_gateway/ui: routing
-// mode switch (auto / pinned / jev), provider+model pinning, live Jev routing
-// decisions, breaker state and counters. Single self-contained document, no
-// external assets, refreshes via fetch polling every 2s. Codes against the
+// uiHTML is the loopback-only control page served at /_gateway/ui. Two tabs:
+// Control (routing mode switch, provider+model pinning, live Jev routing
+// decisions, breaker state and counters; polls every 2s) and Spend (paid spend
+// today, per-provider traffic, Claude plan windows, DeepSeek credit, per-day
+// table, latest requests; polls /_gateway/spend every 10s). Single
+// self-contained document, no external assets. Codes against the
 // /_gateway/route + /_gateway/status contract and degrades when fields are
 // missing (no "mode" => auto, no "jev" => disabled).
 const uiHTML = `<!doctype html>
@@ -182,6 +184,40 @@ const uiHTML = `<!doctype html>
   .hintrow { display: flex; gap: 8px; align-items: flex-start; }
   @media (max-width: 560px) { .hintrow { flex-direction: column; } }
   .vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  /* tabs */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: -4px 0 14px; }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent;
+                 padding: 8px 14px; min-height: 0; color: var(--muted); }
+  .tabs button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+  .tabs button:hover:not([aria-selected="true"]) { color: var(--fg); border-color: transparent transparent var(--line2); }
+  .tabs .paid { color: var(--bad); font-weight: 600; margin-left: 6px; }
+
+  /* spend */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .kpi { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+  .kpi .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .kpi .v { font-size: 24px; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kpi .s { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .v.bad { color: var(--bad); } .v.ok { color: var(--ok); }
+  .wins { display: flex; flex-direction: column; gap: 10px; }
+  .win .head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+  .win .bar { height: 10px; margin-top: 4px; }
+  .win .bar .fill { background: var(--anthropic); }
+  .win .bar.low .fill { background: var(--bad); }
+  .hours { display: flex; align-items: flex-end; gap: 2px; height: 110px; margin-top: 6px; }
+  .hours .h { flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column-reverse; }
+  .hours .h span { display: block; width: 100%; }
+  .hours .h.now { outline: 1px dashed var(--line2); outline-offset: 1px; }
+  .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .scroll { overflow-x: auto; }
+  table.num { table-layout: auto; font-variant-numeric: tabular-nums; }
+  table.num td, table.num th { white-space: nowrap; }
+  table.num td.r, table.num th.r { text-align: right; }
+  .fo { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -214,6 +250,12 @@ const uiHTML = `<!doctype html>
 
 <div class="banner" id="banner" role="alert" hidden><span class="dot"></span>gateway unreachable &mdash; retrying</div>
 
+<nav class="tabs" role="tablist" aria-label="views">
+  <button type="button" role="tab" id="tab-control" aria-controls="view-control" aria-selected="true" onclick="showTab('control')">Control</button>
+  <button type="button" role="tab" id="tab-spend" aria-controls="view-spend" aria-selected="false" onclick="showTab('spend')">Spend<span class="paid" id="tabPaid"></span></button>
+</nav>
+
+<div id="view-control" role="tabpanel" aria-labelledby="tab-control">
 <section class="card">
   <h2>Routing mode</h2>
   <div class="row">
@@ -270,6 +312,34 @@ const uiHTML = `<!doctype html>
     <button type="button" class="copy" onclick="copyCurl()" id="copyBtn">copy</button>
   </div>
 </section>
+</div>
+
+<div id="view-spend" role="tabpanel" aria-labelledby="tab-spend" hidden>
+<div class="kpis" id="kpis"></div>
+<section class="card">
+  <h2>Claude plan windows</h2>
+  <div class="wins" id="wins"></div>
+</section>
+<section class="card">
+  <h2>Requests per hour today</h2>
+  <div class="hours" id="hours" role="img" aria-label="requests per hour, stacked by provider"></div>
+  <div class="axis"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
+  <div class="legend">
+    <span><i style="background:var(--anthropic)"></i>anthropic</span>
+    <span><i style="background:var(--glm)"></i>glm</span>
+    <span><i style="background:var(--deepseek)"></i>deepseek</span>
+  </div>
+</section>
+<section class="card scroll">
+  <h2>Per day</h2>
+  <table class="num" id="days"></table>
+</section>
+<section class="card scroll">
+  <h2>Latest requests</h2>
+  <table class="num" id="recent"></table>
+  <div class="muted small" id="spendFoot" style="margin-top:8px"></div>
+</section>
+</div>
 
 <script>
 'use strict';
@@ -535,8 +605,137 @@ function selectCurl() {
   var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
 }
 
+// ---- spend tab ----
+var spend = null;
+var tab = 'control';
+try { if (localStorage.getItem('conduit.tab') === 'spend') tab = 'spend'; } catch (e) {}
+
+function showTab(t) {
+  tab = t;
+  try { localStorage.setItem('conduit.tab', t); } catch (e) {}
+  ['control', 'spend'].forEach(function (k) {
+    $('tab-' + k).setAttribute('aria-selected', String(k === t));
+    $('view-' + k).hidden = k !== t;
+  });
+  if (t === 'spend' && spend) renderSpend(spend);
+}
+
+function usd(n) { return n == null || isNaN(n) ? '–' : '$' + Number(n).toFixed(2); }
+function usd4(n) {
+  if (n == null || isNaN(n)) return '–';
+  if (n === 0) return '$0';
+  return n < 0.01 ? '$' + Number(n).toFixed(4) : '$' + Number(n).toFixed(2);
+}
+function tok(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e4) return Math.round(n / 1e3) + 'k';
+  return String(n);
+}
+function resetIn(iso) {
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  var s = Math.round((d.getTime() - Date.now()) / 1000);
+  if (s <= 0) return 'resetting';
+  var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return 'resets in ' + (h >= 24 ? Math.floor(h / 24) + 'd ' + (h % 24) + 'h' : h + 'h ' + m + 'm');
+}
+
+async function refreshSpend() {
+  try {
+    var x = await fetch('/_gateway/spend');
+    spend = await x.json();
+  } catch (e) { return; }
+  var paid = spend.today_paid_usd || 0;
+  document.title = (paid > 0 ? usd(paid) + ' · ' : '') + 'conduit';
+  $('tabPaid').textContent = paid > 0 ? usd(paid) : '';
+  if (tab === 'spend') renderSpend(spend);
+}
+
+function renderSpend(d) {
+  var paid = d.today_paid_usd || 0;
+  var prov = d.providers || {};
+  var ds = prov.deepseek || {};
+  var cl = d.claude || null;
+  var ex = cl && cl.extra_usage;
+  var bal = d.deepseek_balance;
+  var sv = d.serving || null;
+  var svColor = sv && PROVIDERS.indexOf(sv.provider) >= 0 ? ' style="color:var(--' + sv.provider + ')"' : '';
+  // [label, value class, value html, sub-line html]
+  var tiles = [
+    ['Paid today', paid > 0 ? 'bad' : 'ok', usd(paid),
+      Object.keys(prov).sort().map(function (p) { return esc(p) + ' ' + usd(prov[p].usd); }).join(' · ') || 'no requests yet'],
+    ['DeepSeek requests today', '', String(d.deepseek_requests || 0),
+      (d.deepseek_failovers || 0) + ' failovers · credit ' + (bal ? usd(bal.usd) : (d.deepseek_balance_error ? 'unavailable' : '–'))],
+    ['Claude extra usage', ex && ex.spent_usd > 0 ? 'bad' : '', ex ? usd(ex.spent_usd) : '–',
+      ex ? 'of ' + usd(ex.limit_usd) + ' cap' + (cl.plan ? ' · plan ' + esc(cl.plan) : '') : (d.claude_error ? 'quota unavailable' : 'quota not configured')],
+    ['Serving now', '', sv && sv.provider ? '<span' + svColor + '>' + esc(sv.provider) + '</span>' : '–',
+      sv ? esc(sv.upstream_model || '') + ' · ' + fmtTime(sv.at) : 'no requests since start']
+  ];
+  $('kpis').innerHTML = tiles.map(function (t) {
+    return '<div class="kpi"><div class="k">' + t[0] + '</div><div class="v ' + t[1] + '">' + t[2] + '</div><div class="s">' + t[3] + '</div></div>';
+  }).join('');
+
+  var wins = (cl && cl.windows) || [];
+  var winHTML = wins.filter(function (w) { return typeof w.percent_remaining === 'number'; }).map(function (w) {
+    var pct = Math.max(0, Math.min(100, w.percent_remaining));
+    return '<div class="win"><div class="head"><span><b>' + esc(w.label || w.id) + '</b> ' + Math.round(pct) + '% left</span>' +
+      '<span class="muted small">' + (w.resets_at ? resetIn(w.resets_at) : '') + '</span></div>' +
+      '<div class="bar' + (pct < 15 ? ' low' : '') + '"><span class="fill" style="width:' + pct + '%"></span></div></div>';
+  }).join('');
+  $('wins').innerHTML = winHTML || '<div class="empty">' +
+    (d.claude_error ? 'Claude quota not readable: ' + esc(d.claude_error) : 'Claude quota not available (install quota-axi)') + '</div>';
+
+  var hours = d.hours || [];
+  var max = 1, h, p;
+  for (h = 0; h < 24; h++) {
+    var tot = 0, row = hours[h] || {};
+    for (p in row) tot += row[p];
+    if (tot > max) max = tot;
+  }
+  var nowH = new Date().getHours();
+  var hh = '';
+  for (h = 0; h < 24; h++) {
+    var r = hours[h] || {};
+    var segs = PROVIDERS.map(function (pv) {
+      var n = r[pv] || 0;
+      return n ? '<span style="height:' + (n / max * 100) + '%;background:var(--' + pv + ')"></span>' : '';
+    }).join('');
+    var title = h + ':00 · ' + (PROVIDERS.map(function (pv) { return pv + ' ' + (r[pv] || 0); }).join(', '));
+    hh += '<div class="h' + (h === nowH ? ' now' : '') + '" title="' + esc(title) + '">' + segs + '</div>';
+  }
+  $('hours').innerHTML = hh;
+
+  var days = (d.days || []).slice().reverse().slice(0, 14);
+  $('days').innerHTML = '<thead><tr><th>day</th><th class="r">requests</th><th class="r">anthropic</th><th class="r">glm</th><th class="r">deepseek</th>' +
+    '<th class="r">tokens</th><th class="r">paid</th><th class="r">failovers</th></tr></thead><tbody>' +
+    (days.length ? days.map(function (x) {
+      var pr = x.providers || {};
+      var c = function (k) { return (pr[k] && pr[k].requests) || 0; };
+      return '<tr><td>' + esc(x.day) + '</td><td class="r">' + x.totals.requests + '</td><td class="r">' + c('anthropic') +
+        '</td><td class="r">' + c('glm') + '</td><td class="r">' + c('deepseek') + '</td><td class="r">' + tok(x.totals.tokens) +
+        '</td><td class="r' + (x.totals.paid_usd > 0 ? ' fo' : '') + '">' + usd(x.totals.paid_usd) + '</td><td class="r">' + x.totals.failovers + '</td></tr>';
+    }).join('') : '<tr><td colspan="8" class="empty">no usage recorded yet</td></tr>') + '</tbody>';
+
+  var rec = (d.recent || []).slice(0, 40);
+  $('recent').innerHTML = '<thead><tr><th>time</th><th>provider</th><th>asked</th><th>served by</th><th class="r">in</th><th class="r">out</th>' +
+    '<th class="r">cache</th><th class="r">cost</th></tr></thead><tbody>' +
+    (rec.length ? rec.map(function (x) {
+      var cost = x.billing === 'subscription' ? '<span class="muted">plan</span>' : usd4(x.usd);
+      return '<tr><td>' + fmtTime(x.at) + '</td><td>' + pill(x.provider) + (x.failover ? ' <span class="fo" title="failover">&#10547;</span>' : '') +
+        '</td><td>' + esc(x.requested_model || '') + '</td><td>' + esc(x.upstream_model || '') + '</td><td class="r">' + tok(x.in) +
+        '</td><td class="r">' + tok(x.out) + '</td><td class="r">' + tok((x.cache_read || 0) + (x.cache_write || 0)) + '</td><td class="r">' + cost + '</td></tr>';
+    }).join('') : '<tr><td colspan="8" class="empty">no requests recorded yet</td></tr>') + '</tbody>';
+  $('spendFoot').textContent = 'updated ' + fmtTime(d.now) + (d.since ? ' · ledger since ' + String(d.since).slice(0, 10) : '') +
+    (d.truncated ? ' · partial read (ledger is large)' : '');
+}
+
+showTab(tab);
 refresh();
 setInterval(refresh, 2000);
+refreshSpend();
+setInterval(refreshSpend, 10000);
 </script>
 </body>
 </html>

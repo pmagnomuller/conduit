@@ -200,4 +200,16 @@ func TestSpendEndpoint(t *testing.T) {
 	if res.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("POST status %d", res.StatusCode)
 	}
+	// The control page carries the spend tab.
+	ui, err := http.Get(srv.URL + "/_gateway/ui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(ui.Body)
+	ui.Body.Close()
+	for _, want := range []string{`id="view-spend"`, `/_gateway/spend`, `refreshSpend, 10000`} {
+		if !strings.Contains(string(page), want) {
+			t.Fatalf("ui lacks %q", want)
+		}
+	}
 }
