@@ -25,6 +25,7 @@ import (
 	"github.com/pedro-mueller/conduit/internal/notify"
 	"github.com/pedro-mueller/conduit/internal/redact"
 	"github.com/pedro-mueller/conduit/internal/route"
+	"github.com/pedro-mueller/conduit/internal/usage"
 )
 
 const anthropicUpstream = "anthropic"
@@ -56,6 +57,7 @@ type Gateway struct {
 	capture *capture.Writer
 	metrics *metrics.Counters
 	router  Decider
+	spend   *usage.Service
 	client  *http.Client
 	log     *slog.Logger
 
@@ -92,6 +94,22 @@ func New(cfg config.Config, br *breaker.Breaker, cap *capture.Writer, met *metri
 	}
 }
 
+// SetSpend attaches the usage ledger behind per-request accounting,
+// /_gateway/spend and the paid-spend alert. Without it nothing is recorded and
+// the spend endpoint reports an empty ledger.
+func (g *Gateway) SetSpend(s *usage.Service) { g.spend = s }
+
+// spendServing is the last-request snapshot for the spend payload, nil until a
+// model call has been served.
+func (g *Gateway) spendServing() *usage.Serving {
+	g.lastMu.Lock()
+	defer g.lastMu.Unlock()
+	if g.lastAt.IsZero() {
+		return nil
+	}
+	return &usage.Serving{Provider: g.lastProvider, UpstreamModel: g.lastUpstream, At: g.lastAt.UTC()}
+}
+
 func (g *Gateway) jevEnabled() bool {
 	return g.router != nil && g.router.Enabled()
 }
@@ -104,6 +122,7 @@ func (g *Gateway) Handler() http.Handler {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/_gateway/route", g.handleRoute)
+	mux.HandleFunc("/_gateway/spend", g.handleSpend)
 	mux.HandleFunc("/_gateway/ui", g.handleUI)
 	mux.HandleFunc("/", g.handleProxy)
 	return mux
@@ -543,7 +562,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 				}
 			}
 			g.metrics.IncAnthropic()
-			g.writeUpstream(w, resp, respBody, "anthropic", false, "")
+			g.writeUpstream(w, resp, respBody, "anthropic", false, "", g.spendRecorder("anthropic", model, upstreamModel, false, body))
 			g.logRequest(r, model, upstreamModel, "anthropic", resp.StatusCode, start, false)
 			return
 		}
@@ -577,7 +596,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 			// Mid-stream: already copied error? Shouldn't happen — we only peek
 			// non-2xx before writing. If peeked somehow, surface.
 			g.metrics.IncAnthropic()
-			g.writeUpstream(w, resp, respBody, "anthropic", false, "")
+			g.writeUpstream(w, resp, respBody, "anthropic", false, "", nil)
 			g.logRequest(r, model, upstreamModel, "anthropic", resp.StatusCode, start, false)
 			return
 
@@ -592,7 +611,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 				// state so a later request can try again, or close on next success.
 			}
 			g.metrics.IncAnthropic()
-			g.writeUpstream(w, resp, respBody, "anthropic", false, "")
+			g.writeUpstream(w, resp, respBody, "anthropic", false, "", nil)
 			g.logRequest(r, model, upstreamModel, "anthropic", resp.StatusCode, start, false)
 			return
 		}
@@ -600,7 +619,7 @@ func (g *Gateway) serveAnthropic(w http.ResponseWriter, r *http.Request, body []
 
 	if lastResp != nil {
 		g.metrics.IncAnthropic()
-		g.writeUpstream(w, lastResp, lastBody, "anthropic", false, "")
+		g.writeUpstream(w, lastResp, lastBody, "anthropic", false, "", nil)
 		g.logRequest(r, model, upstreamModel, "anthropic", lastResp.StatusCode, start, false)
 		return
 	}
@@ -656,7 +675,7 @@ func (g *Gateway) serveGLM(w http.ResponseWriter, r *http.Request, body []byte, 
 	// Chat notice on the failover turn (and only when enabled) so Claude Code
 	// surfaces the switch inside the conversation.
 	announceChat := failover && notify.ChatNoticeEnabled() && resp.StatusCode >= 200 && resp.StatusCode < 300
-	g.writeUpstream(w, resp, respBody, "glm", announceChat, announce.DefaultNotice)
+	g.writeUpstream(w, resp, respBody, "glm", announceChat, announce.DefaultNotice, g.spendRecorder("glm", model, glmModel, failover, body))
 	g.logRequest(r, model, glmModel, "glm", resp.StatusCode, start, failover)
 }
 
@@ -783,7 +802,7 @@ func (g *Gateway) serveDeepSeek(w http.ResponseWriter, r *http.Request, body []b
 	}
 	g.metrics.IncDeepSeek()
 	announceChat := failover && notify.ChatNoticeEnabled() && resp.StatusCode >= 200 && resp.StatusCode < 300
-	g.writeUpstream(w, resp, respBody, "deepseek", announceChat, announce.DeepSeekNotice)
+	g.writeUpstream(w, resp, respBody, "deepseek", announceChat, announce.DeepSeekNotice, g.spendRecorder("deepseek", model, dsModel, failover, body))
 	g.logRequest(r, model, dsModel, "deepseek", resp.StatusCode, start, failover)
 }
 
@@ -861,14 +880,36 @@ func (g *Gateway) roundTrip(provider, baseURL string, r *http.Request, body []by
 // instead of resp.Body (already-buffered error). For live streams, bodyBuf is nil.
 // When chatNotice is true, notice is injected into the first assistant text so
 // it appears inside Claude Code.
-func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, bodyBuf []byte, provider string, chatNotice bool, notice string) {
+//
+// When record is non-nil and the response is a success, its usage is parsed
+// from the upstream bytes as they are copied (a usage.Tap on the raw body,
+// ahead of any notice injection; a stream is never held back) and handed to
+// record once the copy ends — however it ends, since a stream the client
+// abandoned was still produced and billed.
+func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, bodyBuf []byte, provider string, chatNotice bool, notice string, record func(usage.Result)) {
 	defer resp.Body.Close()
 
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+	// liveTap is the tap still waiting for bytes: it is fed by the copy loop
+	// below unless the body was already in memory and fed here.
+	var liveTap *usage.Tap
+	if record != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		tap := usage.NewTap(isSSE)
+		defer func() { record(tap.Result()) }()
+		if bodyBuf != nil {
+			_, _ = tap.Write(bodyBuf)
+		} else {
+			liveTap = tap
+		}
+	}
 
 	// Non-SSE success bodies are streamed live; buffer them when we need to inject.
 	if chatNotice && !isSSE && bodyBuf == nil {
 		buf, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if liveTap != nil {
+			_, _ = liveTap.Write(buf)
+			liveTap = nil // fed: the copy below replays the injected buffer
+		}
 		if err == nil {
 			bodyBuf = announce.InjectJSON(buf, notice)
 		} else {
@@ -909,6 +950,9 @@ func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, body
 		src = bytes.NewReader(bodyBuf)
 	} else {
 		src = resp.Body
+		if liveTap != nil {
+			src = io.TeeReader(src, liveTap)
+		}
 	}
 	if chatNotice && isSSE {
 		src = announce.NewSSEInjector(src, notice)
@@ -928,6 +972,23 @@ func (g *Gateway) writeUpstream(w http.ResponseWriter, resp *http.Response, body
 		if err != nil {
 			return
 		}
+	}
+}
+
+// spendRecorder returns the accounting callback writeUpstream runs on a
+// successful reply, or nil when no spend service is attached. provider is the
+// tier that answered, model the requested id, sentModel the id sent upstream.
+// body (the inbound request) is only read, and only when the provider gave
+// no message id, to derive an opaque conversation hash.
+func (g *Gateway) spendRecorder(provider, model, sentModel string, failover bool, body []byte) func(usage.Result) {
+	if g.spend == nil {
+		return nil
+	}
+	return func(res usage.Result) {
+		if res.RequestID == "" && !res.Usage.Empty() {
+			res.RequestID = usage.ConversationID(body)
+		}
+		_, _ = g.spend.Record(provider, model, sentModel, failover, res)
 	}
 }
 

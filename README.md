@@ -42,6 +42,48 @@ Forced routing persists in `state.json` across restarts. Pinning `anthropic`
 suppresses failover (quota errors surface raw); pinning `glm`/`deepseek` pins
 every request to that provider with the model you choose.
 
+### Spend tab
+
+The **Spend** tab shows what your AI traffic costs, refreshed every 10 s:
+paid spend today, DeepSeek requests today (and how many were failovers) with
+the remaining DeepSeek credit, Claude extra usage against its cap, the
+provider serving right now, the Claude plan windows with their reset
+countdowns, requests per hour stacked by provider, a per-day table and the
+latest requests. While anything has been paid today, the browser tab title
+starts with the amount.
+
+Every successful upstream reply's `usage` (input, output, cache-read and
+cache-write tokens; for a stream, from `message_start` and `message_delta`)
+is priced and appended to `~/.local/state/conduit/usage.jsonl`:
+
+```json
+{"at":"2030-01-02T09:30:00Z","provider":"deepseek","requested_model":"claude-sonnet-5","upstream_model":"deepseek-v4-flash","in":1500,"out":42,"cache_read":1024,"cache_write":0,"usd":0.0001,"billing":"metered","failover":true,"request_id":"msg_…","model_source":"response"}
+```
+
+- **billing.** Claude Code's OAuth traffic and a GLM coding plan are
+  `subscription`: tokens are recorded, `usd` is 0. DeepSeek — and Anthropic
+  when `ANTHROPIC_API_KEY` is set, or GLM with `glm_billing = "metered"` — is
+  `metered` and priced. A model missing from the price table is priced at its
+  provider's most expensive known rate and marked `"estimated":true`.
+- **prices** are list USD per million tokens: built in for the catalog models,
+  overridable per model under `[[spend.prices]]` (see `config.example.toml`).
+- **nothing private.** A record holds models, token counts, cost and the
+  provider's message id. Never the prompt, the reply or a credential, and the
+  line is passed through the credential redactor before it is written. The
+  file is 0600 and rotates to `usage.jsonl.1` at 32 MiB.
+- **alert.** When today's paid spend first goes above $0, and again each time
+  it grows by `alert_step_usd` ($0.50), a desktop notification is posted
+  (macOS: `osascript`; Linux: `notify-send`). Once per amount per day, also
+  across restarts. `[spend] alert = false` or `CONDUIT_SPEND_NOTIFY=0` turns
+  it off.
+
+`GET /_gateway/spend` returns all of it as JSON (`?days=N`, default 14;
+`?recent=N`, default 40). The DeepSeek credit comes from
+`GET https://api.deepseek.com/user/balance` (only with `DEEPSEEK_API_KEY`,
+cached 2 min); the Claude plan windows and extra usage from
+`quota-axi --provider claude --json --max-age 2m` when `quota-axi` is on
+`PATH`. Either one missing leaves its section out.
+
 ## Control CLI
 
 `./setup.sh` also installs `~/.local/bin/conduitctl` — a thin client for the
@@ -55,6 +97,9 @@ conduitctl route pin glm glm-5.3            # → pinned
 conduitctl status                           # mode, routing, breaker countdowns, counters
 conduitctl status -json                     # the raw /_gateway/status payload
 conduitctl decisions -n 5                   # tail ~/.local/state/conduit/decisions.jsonl
+conduitctl spend                            # paid today, per provider, credit, plan windows, per day
+conduitctl spend -days 30 -json             # the raw /_gateway/spend payload
+conduitctl spend line                       # one line for run reports
 conduitctl ui                               # open the control page
 ```
 

@@ -68,6 +68,35 @@ capture_path = "~/.local/state/conduit/upstream-errors.jsonl"
 # (or ~/.local/state/conduit/state.json).
 state_path = ""
 
+# Per-request usage and cost: every successful upstream reply's token usage is
+# priced and appended to usage_path; GET /_gateway/spend, the Spend tab of
+# /_gateway/ui and `conduitctl spend` read it. Claude Code OAuth and GLM
+# coding-plan traffic is recorded as billing "subscription" at $0; DeepSeek
+# (and Anthropic when ANTHROPIC_API_KEY is set) is "metered" and priced.
+[spend]
+usage_path = "~/.local/state/conduit/usage.jsonl"
+# Desktop notification when today's paid spend goes above $0, then each time
+# it grows by alert_step_usd. CONDUIT_SPEND_NOTIFY=0 also turns it off.
+alert = true
+alert_step_usd = 0.50
+# "metered" if your Z.ai key is pay-as-you-go rather than a coding plan.
+# glm_billing = "metered"
+# DeepSeek credit balance (needs DEEPSEEK_API_KEY), cached this long.
+balance_url = "https://api.deepseek.com/user/balance"
+balance_cache_seconds = 120
+# Claude plan windows and extra usage, read from quota-axi when installed.
+claude_quota = true
+# Prices, USD per million tokens. Built-in list prices cover the models in
+# the default Jev catalog; an entry here wins for its provider/model, and a
+# rate left out keeps the built-in one.
+# [[spend.prices]]
+# provider = "deepseek"
+# model = "deepseek-v4-flash"
+# price_in = 0.30
+# price_out = 1.20
+# price_cache_read = 0.006
+# price_cache_write = 0.30
+
 # Notifications when failing over to GLM (env toggles; no TOML keys required):
 # - macOS/Linux desktop toast (disable with CONDUIT_DESKTOP_NOTIFY=0)
 # - one-shot chat notice inside Claude Code on the failover reply

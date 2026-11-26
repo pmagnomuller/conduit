@@ -21,6 +21,7 @@ import (
 type recorded struct {
 	Method string
 	Path   string
+	Query  string
 	CT     string
 	Body   string
 	Origin string
@@ -50,6 +51,7 @@ func newStub(t *testing.T, replies map[string]reply) *stub {
 		s.recs = append(s.recs, recorded{
 			Method: r.Method,
 			Path:   r.URL.Path,
+			Query:  r.URL.RawQuery,
 			CT:     r.Header.Get("Content-Type"),
 			Body:   string(body),
 			Origin: r.Header.Get("Origin"),

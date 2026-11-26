@@ -25,6 +25,8 @@ usage:
   conduitctl route pin <provider> [model]
   conduitctl status [-json]            human summary, or the raw payload
   conduitctl decisions [-n N]          tail the Jev decision log (default 20)
+  conduitctl spend [-days N] [-json]   AI spend: today, per provider, per day
+  conduitctl spend line                one-line spend summary for run reports
   conduitctl ui                        open the control page in a browser
 
 The gateway URL defaults to http://127.0.0.1:8787; override it with
@@ -59,6 +61,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runStatus(rest, stdout, stderr)
 	case "decisions":
 		return runDecisions(rest, stdout, stderr)
+	case "spend":
+		return runSpend(rest, stdout, stderr)
 	case "ui":
 		return runUI(rest, stdout, stderr)
 	case "-h", "--help", "help":
